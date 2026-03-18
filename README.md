@@ -6,6 +6,11 @@ Tampermonkey userscript for CFTools that adds a few admin quality-of-life tools:
 - Create a Discord ban entry template from a player profile
 - Compare trace names between two CFTools profiles
 
+## What It Works On
+
+- `https://app.cftools.cloud/*`
+- Other `cftools.cloud` pages matched by the userscript header
+
 ## Install Tampermonkey
 
 ### Google Chrome
@@ -24,6 +29,10 @@ Tampermonkey userscript for CFTools that adds a few admin quality-of-life tools:
 4. Click `Add to Firefox`.
 5. Confirm the install.
 
+### Other Chromium Browsers
+
+If you use Edge, Brave, Opera, or another Chromium-based browser, the Chrome steps are usually the same.
+
 ## Install This Script
 
 ### Option 1: Direct install from GitHub
@@ -31,7 +40,7 @@ Tampermonkey userscript for CFTools that adds a few admin quality-of-life tools:
 1. Make sure Tampermonkey is installed and enabled.
 2. Open this install link:
 
-[Install the userscript](https://github.com/AustinSP/cf-to-vpp/raw/refs/heads/main/cftools-vpp.user.js)
+[Install the userscript](https://github.com/worstpotato/CFTools-TamperMonkey/raw/refs/heads/main/cftools-vpp.user.js)
 
 3. Tampermonkey should open an install page automatically.
 4. Click `Install`.
@@ -40,7 +49,7 @@ Tampermonkey userscript for CFTools that adds a few admin quality-of-life tools:
 
 1. Open the repository:
 
-[AustinSP/cf-to-vpp](https://github.com/AustinSP/cf-to-vpp)
+[worstpotato/CFTools-TamperMonkey](https://github.com/worstpotato/CFTools-TamperMonkey)
 
 2. Open the latest `.user.js` file in the repo.
 3. Click the `Raw` button.
@@ -51,7 +60,7 @@ Tampermonkey userscript for CFTools that adds a few admin quality-of-life tools:
 
 If you installed the script through Tampermonkey, it should use the built-in update link from the script header:
 
-[Update / download URL](https://github.com/AustinSP/cf-to-vpp/raw/refs/heads/main/cftools-vpp.user.js)
+[Update / download URL](https://github.com/worstpotato/CFTools-TamperMonkey/raw/refs/heads/main/cftools-vpp.user.js)
 
 You can also:
 
@@ -96,3 +105,27 @@ It will:
 3. Open the other profile.
 4. Collect its traces.
 5. Copy the shared traces to your clipboard.
+
+## Troubleshooting
+
+### Tampermonkey does not prompt to install
+
+- Make sure the extension is enabled.
+- Try opening the direct install link again.
+- If needed, open the raw `.user.js` file from GitHub manually.
+
+### The button does not appear
+
+- Refresh the CFTools page.
+- Make sure you are on a supported CFTools profile/event page.
+- Check that Tampermonkey is enabled for the site.
+
+### The script installed but does not seem updated
+
+- Open Tampermonkey and check for script updates.
+- Reinstall using the direct install link above.
+
+## Notes
+
+- This script is intended as a quality-of-life helper for CFTools admins.
+- It is designed to avoid destructive actions and only automates navigation, reading page data, and copying text.
