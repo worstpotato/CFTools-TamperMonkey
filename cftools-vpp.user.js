@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CFTools Tools: VPP Coord Copier
 // @namespace    austin.cftools.vpp
-// @version      4.2
+// @version      5.0
 // @description  Adds coordinate copy tools, Discord ban entry creation, and profile trace comparison helpers for CFTools
 // @match        https://*cftools*/*
 // @match        https://*.cftools.cloud/*
@@ -448,8 +448,161 @@
 
   async function clickProfileLink(label) {
     const link = await waitForElement(() => findProfileLink(label), 15000);
-    link.click();
+    clickElement(link);
     return link;
+  }
+
+  // Some CFTools UI elements behave more reliably with a real mouse-event sequence
+  // than with a plain element.click(), so this is used for navigation-style controls.
+  function clickElement(element) {
+    if (!element) return false;
+
+    const eventView = element.ownerDocument?.defaultView || null;
+    const mouseOptions = eventView
+      ? { bubbles: true, cancelable: true, view: eventView }
+      : { bubbles: true, cancelable: true };
+
+    try {
+      element.scrollIntoView({ block: 'center', inline: 'nearest' });
+    } catch {}
+
+    try {
+      element.click();
+    } catch {}
+
+    element.dispatchEvent(new MouseEvent('mousedown', mouseOptions));
+    element.dispatchEvent(new MouseEvent('mouseup', mouseOptions));
+    return element.dispatchEvent(new MouseEvent('click', mouseOptions));
+  }
+
+  // Finds the server links in the left profile sidebar that show the blue person badge,
+  // which means the player has server-specific data available there.
+  function getServerEntryNames() {
+    const names = new Set();
+    const links = document.querySelectorAll('.profile-links .profile-server-link');
+
+    for (const link of links) {
+      const hasEntryBadge = Boolean(link.querySelector('.badge.badge-primary .fa-user'));
+      if (!hasEntryBadge) continue;
+
+      const name = getCleanText(link);
+      if (name) names.add(name);
+    }
+
+    return Array.from(names);
+  }
+
+  function findServerLinkByName(serverName) {
+    const links = document.querySelectorAll('.profile-links .profile-server-link');
+    for (const link of links) {
+      const text = getCleanText(link);
+      if (text === serverName || text.startsWith(serverName)) {
+        return link;
+      }
+    }
+    return null;
+  }
+
+  function findIpHistoryButton() {
+    const buttons = document.querySelectorAll('button.btn.btn-primary.btn-rounded.btn-sm');
+    for (const button of buttons) {
+      if (getCleanText(button) === 'IP history') {
+        return button;
+      }
+    }
+    return null;
+  }
+
+  function getIpHistoryModal() {
+    const modals = document.querySelectorAll('.modal-content');
+    for (const modal of modals) {
+      const title = getCleanText(modal.querySelector('.modal-title'));
+      if (title === 'IP history') {
+        return modal;
+      }
+    }
+    return null;
+  }
+
+  function extractIpsFromModal(modal) {
+    const ips = [];
+    const seen = new Set();
+    const ipNodes = modal.querySelectorAll('tbody th .text-copyable');
+
+    for (const node of ipNodes) {
+      const value = getCleanText(node);
+      if (!/^(?:\d{1,3}\.){3}\d{1,3}$/.test(value)) continue;
+      if (seen.has(value)) continue;
+
+      seen.add(value);
+      ips.push(value);
+    }
+
+    return ips;
+  }
+
+  async function closeIpHistoryModal(modal) {
+    const closeButton = modal.querySelector('.modal-header .close');
+    if (!closeButton) return;
+
+    clickElement(closeButton);
+    await waitForElement(() => !getIpHistoryModal(), 10000);
+  }
+
+  async function openServerEntry(serverName, timeoutMs = 15000) {
+    const started = Date.now();
+
+    while (Date.now() - started < timeoutMs) {
+      const serverLink = await waitForElement(() => findServerLinkByName(serverName), 5000);
+      const ipButtonBefore = findIpHistoryButton();
+      clickElement(serverLink);
+
+      try {
+        await waitForElement(() => {
+          const refreshedServerLink = findServerLinkByName(serverName);
+          const activeServerName = getActiveServerName();
+          const isActive = Boolean(refreshedServerLink?.classList.contains('profile-link-active'));
+          const ipButton = findIpHistoryButton();
+          return ((isActive || activeServerName === serverName) && ipButton)
+            || (ipButton && ipButton !== ipButtonBefore)
+            ? ipButton
+            : null;
+        }, 4000);
+        return;
+      } catch {}
+
+      await delay(250);
+    }
+
+    throw new Error(`Timed out opening server entry for ${serverName}.`);
+  }
+
+  // Goes back to Overview, then checks every server entry that has the blue badge
+  // and collects all IPs from the IP history modal.
+  async function collectAllIps() {
+    const collected = new Set();
+
+    await clickProfileLink('Overview');
+    await waitForElement(() => {
+      return document.querySelector('.card-body.position-relative')
+        || document.querySelector('.profile-links .profile-server-link');
+    }, 15000);
+
+    const serverNames = getServerEntryNames();
+    for (const serverName of serverNames) {
+      await openServerEntry(serverName);
+
+      const ipButton = await waitForElement(() => findIpHistoryButton(), 10000);
+      clickElement(ipButton);
+
+      const modal = await waitForElement(() => getIpHistoryModal(), 10000);
+      const ips = extractIpsFromModal(modal);
+      ips.forEach(ip => collected.add(ip));
+
+      await closeIpHistoryModal(modal);
+    }
+
+    return Array.from(collected);
   }
 
   // Opens Identities, then Traces, and waits until the trace content is really visible.
@@ -549,8 +702,8 @@
     return Array.from(collected);
   }
 
-  // Final compare output is intentionally simple: shared trace names only.
-  function buildTraceCompareReport(sourceProfile, targetProfile, sourceTraces, targetTraces) {
+  // Final compare output keeps the report simple: shared traces and shared IPs.
+  function buildTraceCompareReport(sourceProfile, targetProfile, sourceTraces, targetTraces, sourceIps, targetIps) {
     const targetSet = new Map(targetTraces.map(trace => [trace.toLowerCase(), trace]));
     const shared = sourceTraces
       .filter(trace => targetSet.has(trace.toLowerCase()))
@@ -558,8 +711,16 @@
       .sort((a, b) => a.localeCompare(b));
 
     const uniqueShared = Array.from(new Set(shared));
+    const targetIpSet = new Set(targetIps);
+    const sharedIps = Array.from(new Set(sourceIps.filter(ip => targetIpSet.has(ip)))).sort((a, b) => a.localeCompare(b));
 
-    return uniqueShared.length ? uniqueShared.join('\n') : 'None found';
+    return [
+      'Shared Traces:',
+      ...(uniqueShared.length ? uniqueShared : ['None found']),
+      '',
+      'Shared IPs:',
+      ...(sharedIps.length ? sharedIps : ['None found']),
+    ].join('\n');
   }
 
   // Only allow compare targets that look like real CFTools profile URLs.
@@ -677,11 +838,14 @@
         toast('Collecting traces from first profile...');
         await openTracesTab();
         const sourceTraces = await collectAllTraces();
+        toast('Collecting IPs from first profile...');
+        const sourceIps = await collectAllIps();
 
         saveTraceCompareState({
           stage: 'collect-target',
           sourceProfile: state.sourceProfile,
           sourceTraces,
+          sourceIps,
           targetUrl: state.targetUrl,
         });
 
@@ -700,12 +864,16 @@
         toast('Collecting traces from second profile...');
         await openTracesTab();
         const targetTraces = await collectAllTraces();
+        toast('Collecting IPs from second profile...');
+        const targetIps = await collectAllIps();
         const targetProfile = getCurrentProfileSummary();
         const report = buildTraceCompareReport(
           state.sourceProfile,
           targetProfile,
           state.sourceTraces || [],
-          targetTraces
+          targetTraces,
+          state.sourceIps || [],
+          targetIps
         );
 
         clearTraceCompareState();
