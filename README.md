@@ -29,10 +29,6 @@ Tampermonkey userscript for CFTools that adds a few admin quality-of-life tools:
 4. Click `Add to Firefox`.
 5. Confirm the install.
 
-### Other Chromium Browsers
-
-If you use Edge, Brave, Opera, or another Chromium-based browser, the Chrome steps are usually the same.
-
 ## Install This Script
 
 ### Option 1: Direct install from GitHub
@@ -105,27 +101,3 @@ It will:
 3. Open the other profile.
 4. Collect its traces.
 5. Copy the shared traces to your clipboard.
-
-## Troubleshooting
-
-### Tampermonkey does not prompt to install
-
-- Make sure the extension is enabled.
-- Try opening the direct install link again.
-- If needed, open the raw `.user.js` file from GitHub manually.
-
-### The button does not appear
-
-- Refresh the CFTools page.
-- Make sure you are on a supported CFTools profile/event page.
-- Check that Tampermonkey is enabled for the site.
-
-### The script installed but does not seem updated
-
-- Open Tampermonkey and check for script updates.
-- Reinstall using the direct install link above.
-
-## Notes
-
-- This script is intended as a quality-of-life helper for CFTools admins.
-- It is designed to avoid destructive actions and only automates navigation, reading page data, and copying text.
