@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         CFTools Tools: VPP Coord Copier
+// @name         CFTools Tools: Helper Script
 // @namespace    austin.cftools.vpp
 // @version      5.4
 // @description  Adds coordinate copy tools, Discord ban entry creation, and profile trace comparison helpers for CFTools
