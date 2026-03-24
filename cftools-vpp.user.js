@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CFTools Tools: Helper Script
 // @namespace    austin.cftools.vpp
-// @version      5.4
+// @version      5.4.1
 // @description  Adds coordinate copy tools, Discord ban entry creation, and profile trace comparison helpers for CFTools
 // @match        https://*cftools*/*
 // @match        https://*.cftools.cloud/*
