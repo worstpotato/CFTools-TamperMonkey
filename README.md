@@ -73,7 +73,7 @@ When CFTools shows coordinates like:
 - `X: 1998.39, Y: 7165.76, Z: 237.39`
 - `position: [ 1998.39, 7165.76, 237.39 ]`
 
-The script adds a `Copy VPP` button and copies them as:
+The script adds a `Copy X,Z,Y` button and copies them as:
 
 `1998.39,237.39,7165.76`
 
