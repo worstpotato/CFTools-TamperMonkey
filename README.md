@@ -6,11 +6,6 @@ Tampermonkey userscript for CFTools that adds a few admin quality-of-life tools:
 - Create a Discord ban entry template from a player profile
 - Compare trace names between two CFTools profiles
 
-## What It Works On
-
-- `https://app.cftools.cloud/*`
-- Other `cftools.cloud` pages matched by the userscript header
-
 ## Install Tampermonkey
 
 ### Google Chrome
