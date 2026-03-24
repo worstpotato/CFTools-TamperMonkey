@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CFTools Tools: VPP Coord Copier
 // @namespace    austin.cftools.vpp
-// @version      5.2
+// @version      5.4
 // @description  Adds coordinate copy tools, Discord ban entry creation, and profile trace comparison helpers for CFTools
 // @match        https://*cftools*/*
 // @match        https://*.cftools.cloud/*
@@ -330,6 +330,7 @@
     const activeServer = getActiveServerLink();
     const activeServerName = getActiveServerName();
     const identitiesLink = findProfileLink('Identities');
+    const activeTopNav = getActiveTopNavLabel();
     if (!identitiesLink) {
       throw new Error('Could not find the Identities tab.');
     }
@@ -337,9 +338,18 @@
     identitiesLink.click();
     await delay(250);
 
+    if (findTopNavLink('Identities')) {
+      const identitiesTopNav = findTopNavLink('Identities');
+      clickElement(identitiesTopNav);
+      await waitForElement(() => getActiveTopNavLabel().toLowerCase() === 'identities', 15000);
+    }
+
     const steam64 = await waitForSteam64();
 
-    if (activeServer) {
+    if (activeTopNav && activeTopNav.toLowerCase() === 'traces' && findTopNavLink('Traces')) {
+      const tracesTopNav = findTopNavLink('Traces');
+      clickElement(tracesTopNav);
+    } else if (activeServer) {
       activeServer.click();
     }
 
@@ -732,8 +742,9 @@
     return Array.from(collected);
   }
 
-  // Final compare output keeps the report simple: shared traces and shared IPs.
-  function buildTraceCompareReport(sourceProfile, targetProfile, sourceTraces, targetTraces, sourceIps, targetIps) {
+  // Final compare output keeps the report simple: shared traces, shared IPs,
+  // and the two compared profile URLs with Steam64 values.
+  function buildTraceCompareReport(sourceProfile, targetProfile, sourceTraces, targetTraces, sourceIps, targetIps, targetUrl = '', sourceSteam64 = '', targetSteam64 = '') {
     const targetSet = new Map(targetTraces.map(trace => [trace.toLowerCase(), trace]));
     const shared = sourceTraces
       .filter(trace => targetSet.has(trace.toLowerCase()))
@@ -743,6 +754,10 @@
     const uniqueShared = Array.from(new Set(shared));
     const targetIpSet = new Set(targetIps);
     const sharedIps = Array.from(new Set(sourceIps.filter(ip => targetIpSet.has(ip)))).sort((a, b) => a.localeCompare(b));
+    const sourceUrl = sourceProfile?.url || '';
+    const compareTargetUrl = targetUrl || targetProfile?.url || '';
+    const sourceAccountLine = sourceSteam64 ? `${sourceUrl} (${sourceSteam64})` : sourceUrl;
+    const targetAccountLine = targetSteam64 ? `${compareTargetUrl} (${targetSteam64})` : compareTargetUrl;
 
     return [
       'Shared Traces:',
@@ -750,6 +765,10 @@
       '',
       'Shared IPs:',
       ...(sharedIps.length ? sharedIps : ['None found']),
+      '',
+      'Accounts:',
+      sourceAccountLine,
+      targetAccountLine,
     ].join('\n');
   }
 
@@ -869,6 +888,12 @@
         toast('Collecting traces from first profile...');
         await openTracesTab();
         const sourceTraces = await collectAllTraces();
+        let sourceSteam64 = '';
+        try {
+          toast('Collecting Steam64 from first profile...');
+          const sourceSteamResult = await fetchSteam64FromUi();
+          sourceSteam64 = sourceSteamResult.steam64 || '';
+        } catch {}
         toast('Collecting IPs from first profile...');
         const sourceIps = await collectAllIps();
 
@@ -877,6 +902,7 @@
           sourceProfile: state.sourceProfile,
           sourceTraces,
           sourceIps,
+          sourceSteam64,
           targetUrl: state.targetUrl,
         });
 
@@ -895,6 +921,12 @@
         toast('Collecting traces from second profile...');
         await openTracesTab();
         const targetTraces = await collectAllTraces();
+        let targetSteam64 = '';
+        try {
+          toast('Collecting Steam64 from second profile...');
+          const targetSteamResult = await fetchSteam64FromUi();
+          targetSteam64 = targetSteamResult.steam64 || '';
+        } catch {}
         toast('Collecting IPs from second profile...');
         const targetIps = await collectAllIps();
         const targetProfile = getCurrentProfileSummary();
@@ -904,7 +936,10 @@
           state.sourceTraces || [],
           targetTraces,
           state.sourceIps || [],
-          targetIps
+          targetIps,
+          state.targetUrl,
+          state.sourceSteam64 || '',
+          targetSteam64
         );
         const returnUrl = state.sourceProfile?.url || '';
 
