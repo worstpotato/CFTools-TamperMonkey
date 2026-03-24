@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CFTools Tools: VPP Coord Copier
 // @namespace    austin.cftools.vpp
-// @version      5.1
+// @version      5.2
 // @description  Adds coordinate copy tools, Discord ban entry creation, and profile trace comparison helpers for CFTools
 // @match        https://*cftools*/*
 // @match        https://*.cftools.cloud/*
@@ -119,7 +119,7 @@
       const btn = document.createElement('button');
       btn.className = 'vpp-copy-btn';
       btn.type = 'button';
-      btn.textContent = 'Copy VPP';
+      btn.textContent = 'Copy X, Z, Y';
       btn.style.cssText = `
         margin-left: 6px; background: #222; color: #fff;
         border: 1px solid #444; border-radius: 6px; cursor: pointer;
@@ -408,6 +408,30 @@
     return getCfIdFromUrl(href || '');
   }
 
+  // Reads the profile id from the rendered page content only.
+  // This is safer than the URL during SPA route changes, because the URL can update
+  // before the visible profile content has finished switching over.
+  function getRenderedProfileId() {
+    return getCfIdFromPage();
+  }
+
+  // The report should only show after the original profile is visibly rendered again,
+  // not just after the SPA URL changes.
+  function isRenderedSourceProfileReady(sourceProfile) {
+    const expectedSourceCfid = sourceProfile?.cfid || getProfileIdFromUrl(sourceProfile?.url);
+    const renderedCfid = getRenderedProfileId();
+    if (!renderedCfid) return false;
+    if (expectedSourceCfid && renderedCfid !== expectedSourceCfid) return false;
+
+    const expectedName = (sourceProfile?.name || '').trim();
+    const renderedName = getProfileName();
+    if (expectedName && renderedName && renderedName !== expectedName) return false;
+
+    const hasProfileHeader = Boolean(document.querySelector('.profile-container-left .text-copyable.text-code'));
+    const hasProfileLinks = Boolean(document.querySelector('.profile-links .profile-link'));
+    return hasProfileHeader && hasProfileLinks;
+  }
+
   function isTraceCompareStateExpired(state) {
     if (!state?.createdAt) return true;
     return (Date.now() - state.createdAt) > TRACE_COMPARE_RESUME_TTL_MS;
@@ -627,7 +651,12 @@
   }
 
   // Pulls the visible trace values from the current page of results.
-  function extractTracesFromPage() {
+  function isIgnoredTraceName(value) {
+    return /^survivor(?:\s*\(\d+\))?$/i.test(value);
+  }
+
+  function extractTracesFromPage(options = {}) {
+    const { includeIgnored = true } = options;
     const traces = [];
     const seen = new Set();
 
@@ -637,6 +666,7 @@
 
       const value = getCleanText(copyable);
       if (!value || seen.has(value)) continue;
+      if (!includeIgnored && isIgnoredTraceName(value)) continue;
 
       seen.add(value);
       traces.push(value);
@@ -675,7 +705,7 @@
     while (pageGuard < 200) {
       pageGuard += 1;
 
-      const pageTraces = extractTracesFromPage();
+      const pageTraces = extractTracesFromPage({ includeIgnored: false });
       pageTraces.forEach(trace => collected.add(trace));
 
       const nextButton = getTracePaginationNextButton();
@@ -684,7 +714,7 @@
       const disabled = nextButton.disabled || nextButton.classList.contains('disabled');
       if (disabled) break;
 
-      const beforeSnapshot = pageTraces.join('|');
+      const beforeSnapshot = extractTracesFromPage().join('|');
       const beforePageNumber = getTracePageNumber();
       nextButton.click();
 
@@ -814,7 +844,8 @@
   // Two-stage workflow:
   // 1. Collect traces on the current profile.
   // 2. Navigate to the target profile and collect theirs.
-  // 3. Copy and show the overlap report.
+  // 3. Navigate back to the source profile.
+  // 4. Copy and show the overlap report there.
   async function resumeTraceCompareWorkflow() {
     if (traceCompareRunning) return;
 
@@ -875,7 +906,53 @@
           state.sourceIps || [],
           targetIps
         );
+        const returnUrl = state.sourceProfile?.url || '';
 
+        if (returnUrl && returnUrl !== location.href) {
+          saveTraceCompareState({
+            stage: 'show-report',
+            sourceProfile: state.sourceProfile,
+            report,
+          });
+          location.href = returnUrl;
+          return;
+        }
+
+        clearTraceCompareState();
+
+        const copied = await copyText(report);
+        console.log(report);
+        toast(copied ? 'Trace comparison copied to clipboard.' : 'Trace comparison ready. Copy failed.');
+        window.alert(report);
+      }
+
+      if (state.stage === 'show-report') {
+        if (!isRenderedSourceProfileReady(state.sourceProfile)) {
+          if (state.readySince) {
+            saveTraceCompareState({
+              ...state,
+              readySince: undefined,
+            });
+          }
+          return;
+        }
+
+        if (!state.readySince) {
+          saveTraceCompareState({
+            ...state,
+            readySince: Date.now(),
+          });
+          setTimeout(() => {
+            scheduleProfileRefresh();
+          }, 900);
+          return;
+        }
+
+        if ((Date.now() - state.readySince) < 800) {
+          return;
+        }
+
+        const report = state.report || 'None found';
         clearTraceCompareState();
 
         const copied = await copyText(report);
