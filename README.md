@@ -1,4 +1,4 @@
-# CFTools Tools: VPP Coord Copier
+# CFTools Tools: Helper Utility
 
 Tampermonkey userscript for CFTools that adds a few admin quality-of-life tools:
 
