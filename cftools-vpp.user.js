@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CFTools Tools: Helper Script
 // @namespace    austin.cftools.vpp
-// @version      5.4.1
+// @version      5.5
 // @description  Adds coordinate copy tools, Discord ban entry creation, and profile trace comparison helpers for CFTools
 // @match        https://*cftools*/*
 // @match        https://*.cftools.cloud/*
@@ -231,7 +231,7 @@
   // Helper used by observers to ignore unrelated DOM churn.
   function mutationsContainRelevantNode(mutations, selector) {
     for (const mutation of mutations) {
-      if (mutation.type === 'attributes' && nodeMatchesOrContains(mutation.target, selector)) {
+      if ((mutation.type === 'attributes' || mutation.type === 'childList') && nodeMatchesOrContains(mutation.target, selector)) {
         return true;
       }
 
@@ -742,18 +742,50 @@
     return Array.from(collected);
   }
 
+  function buildSharedMatchData(sourceTraces, targetTraces, sourceIps, targetIps) {
+    const targetTraceSet = new Map(targetTraces.map(trace => [trace.toLowerCase(), trace]));
+    const sharedTraces = sourceTraces
+      .filter(trace => targetTraceSet.has(trace.toLowerCase()))
+      .map(trace => targetTraceSet.get(trace.toLowerCase()) || trace)
+      .sort((a, b) => a.localeCompare(b));
+
+    const uniqueSharedTraces = Array.from(new Set(sharedTraces));
+    const targetIpSet = new Set(targetIps);
+    const sharedIps = Array.from(new Set(sourceIps.filter(ip => targetIpSet.has(ip)))).sort((a, b) => a.localeCompare(b));
+
+    return {
+      sharedTraces: uniqueSharedTraces,
+      sharedIps,
+    };
+  }
+
+  async function collectProfileComparisonData(profileLabel) {
+    toast(`Collecting traces from ${profileLabel}...`);
+    await openTracesTab();
+    const traces = await collectAllTraces();
+
+    let steam64 = '';
+    try {
+      toast(`Collecting Steam64 from ${profileLabel}...`);
+      const steamResult = await fetchSteam64FromUi();
+      steam64 = steamResult.steam64 || '';
+    } catch {}
+
+    toast(`Collecting IPs from ${profileLabel}...`);
+    const ips = await collectAllIps();
+
+    return {
+      profile: getCurrentProfileSummary(),
+      traces,
+      steam64,
+      ips,
+    };
+  }
+
   // Final compare output keeps the report simple: shared traces, shared IPs,
   // and the two compared profile URLs with Steam64 values.
   function buildTraceCompareReport(sourceProfile, targetProfile, sourceTraces, targetTraces, sourceIps, targetIps, targetUrl = '', sourceSteam64 = '', targetSteam64 = '') {
-    const targetSet = new Map(targetTraces.map(trace => [trace.toLowerCase(), trace]));
-    const shared = sourceTraces
-      .filter(trace => targetSet.has(trace.toLowerCase()))
-      .map(trace => targetSet.get(trace.toLowerCase()) || trace)
-      .sort((a, b) => a.localeCompare(b));
-
-    const uniqueShared = Array.from(new Set(shared));
-    const targetIpSet = new Set(targetIps);
-    const sharedIps = Array.from(new Set(sourceIps.filter(ip => targetIpSet.has(ip)))).sort((a, b) => a.localeCompare(b));
+    const matches = buildSharedMatchData(sourceTraces, targetTraces, sourceIps, targetIps);
     const sourceUrl = sourceProfile?.url || '';
     const compareTargetUrl = targetUrl || targetProfile?.url || '';
     const sourceAccountLine = sourceSteam64 ? `${sourceUrl} (${sourceSteam64})` : sourceUrl;
@@ -761,15 +793,55 @@
 
     return [
       'Shared Traces:',
-      ...(uniqueShared.length ? uniqueShared : ['None found']),
+      ...(matches.sharedTraces.length ? matches.sharedTraces : ['None found']),
       '',
       'Shared IPs:',
-      ...(sharedIps.length ? sharedIps : ['None found']),
+      ...(matches.sharedIps.length ? matches.sharedIps : ['None found']),
       '',
       'Accounts:',
       sourceAccountLine,
       targetAccountLine,
     ].join('\n');
+  }
+
+  function buildAltCompareReport(sourceProfile, sourceSteam64, altResults) {
+    const sourceUrl = sourceProfile?.url || '';
+    const sourceAccountLine = sourceSteam64 ? `${sourceUrl} (${sourceSteam64})` : sourceUrl;
+    const lines = [
+      'Source Account:',
+      sourceAccountLine,
+      '',
+      'Potential Alt Matches:',
+    ];
+
+    if (!altResults.length) {
+      lines.push('None found');
+      return lines.join('\n');
+    }
+
+    altResults.forEach((result, index) => {
+      const targetUrl = result.url || '';
+      const targetAccountLine = result.steam64 ? `${targetUrl} (${result.steam64})` : targetUrl;
+
+      if (index > 0) lines.push('');
+      lines.push(targetAccountLine);
+      lines.push('Shared Traces:');
+      lines.push(...(result.sharedTraces.length ? result.sharedTraces : ['None found']));
+      lines.push('Shared IPs:');
+      lines.push(...(result.sharedIps.length ? result.sharedIps : ['None found']));
+    });
+
+    return lines.join('\n');
+  }
+
+  function saveReportState(sourceProfile, report, successToast, failureToast) {
+    saveTraceCompareState({
+      stage: 'show-report',
+      sourceProfile,
+      report,
+      successToast,
+      failureToast,
+    });
   }
 
   // Only allow compare targets that look like real CFTools profile URLs.
@@ -832,6 +904,116 @@
     return btn;
   }
 
+  function getPotentialAltRow() {
+    const rows = document.querySelectorAll('.card .card-body tbody tr');
+    for (const row of rows) {
+      const label = getCleanText(row.querySelector('td h5'));
+      if (/^Potential alternate accounts$/i.test(label)) {
+        return row;
+      }
+    }
+    return null;
+  }
+
+  function getGeneralCardBody() {
+    const altRow = getPotentialAltRow();
+    if (!altRow) return null;
+
+    const cardBody = altRow.closest('.card-body');
+    return cardBody || null;
+  }
+
+  function getPotentialAltProfileUrls() {
+    const altRow = getPotentialAltRow();
+    if (!altRow) return [];
+
+    const currentCfid = getCfId();
+    const altUrls = new Map();
+
+    altRow.querySelectorAll('a[href*="/profile/"]').forEach(anchor => {
+      const rawHref = anchor.href || anchor.getAttribute('href') || '';
+      const normalizedUrl = normalizeCompareTargetUrl(rawHref);
+      const targetCfid = getCfIdFromUrl(normalizedUrl || '');
+
+      if (!normalizedUrl || !targetCfid) return;
+      if (currentCfid && targetCfid === currentCfid) return;
+
+      altUrls.set(targetCfid, normalizedUrl);
+    });
+
+    return Array.from(altUrls.values());
+  }
+
+  function createAltCompareButton() {
+    const btn = document.createElement('button');
+    btn.id = 'compare-alts-btn';
+    btn.type = 'button';
+    btn.textContent = 'Compare Alts';
+    btn.style.cssText = `
+      margin-left: 10px;
+      background: #2c5aa0;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 12px;
+      line-height: 1.2;
+      padding: 6px 10px;
+      white-space: nowrap;
+      vertical-align: middle;
+    `;
+    btn.addEventListener('mouseenter', () => (btn.style.background = '#3569bb'));
+    btn.addEventListener('mouseleave', () => (btn.style.background = '#2c5aa0'));
+    btn.addEventListener('click', async () => {
+      const altUrls = getPotentialAltProfileUrls();
+      if (!altUrls.length) {
+        toast('No Alt Accounts Found');
+        return;
+      }
+
+      const sourceProfile = getCurrentProfileSummary();
+      saveTraceCompareState({
+        stage: 'alt-collect-source',
+        sourceProfile,
+        altUrls,
+        altResults: [],
+        currentAltIndex: 0,
+      });
+
+      toast('Starting alt comparison...');
+      await resumeTraceCompareWorkflow();
+    });
+    return btn;
+  }
+
+  function ensureAltCompareButton() {
+    const cardBody = getGeneralCardBody();
+    const existing = document.getElementById('compare-alts-btn');
+
+    // Keep the button tied to the presence of the "Potential alternate accounts" section
+    // itself, not to whether the alt links are fully rendered in this exact DOM moment.
+    // CFTools often rerenders Overview in stages, which can make the anchors disappear
+    // briefly and cause the button to flicker if we remove it too aggressively.
+    if (!cardBody) {
+      if (existing) existing.remove();
+      return;
+    }
+
+    const title = cardBody.querySelector('.card-title');
+    if (!title) {
+      if (existing) existing.remove();
+      return;
+    }
+
+    if (existing && existing.parentElement === title) return;
+    if (existing) existing.remove();
+
+    title.style.display = 'inline-flex';
+    title.style.alignItems = 'center';
+
+    title.appendChild(createAltCompareButton());
+  }
+
   // Makes sure the Compare Traces button exists once, and only in the Traces nav area.
   function ensureTraceCompareButton() {
     const tracesNav = findTopNavLink('Traces');
@@ -885,24 +1067,14 @@
           return;
         }
 
-        toast('Collecting traces from first profile...');
-        await openTracesTab();
-        const sourceTraces = await collectAllTraces();
-        let sourceSteam64 = '';
-        try {
-          toast('Collecting Steam64 from first profile...');
-          const sourceSteamResult = await fetchSteam64FromUi();
-          sourceSteam64 = sourceSteamResult.steam64 || '';
-        } catch {}
-        toast('Collecting IPs from first profile...');
-        const sourceIps = await collectAllIps();
+        const sourceData = await collectProfileComparisonData('first profile');
 
         saveTraceCompareState({
           stage: 'collect-target',
           sourceProfile: state.sourceProfile,
-          sourceTraces,
-          sourceIps,
-          sourceSteam64,
+          sourceTraces: sourceData.traces,
+          sourceIps: sourceData.ips,
+          sourceSteam64: sourceData.steam64,
           targetUrl: state.targetUrl,
         });
 
@@ -918,37 +1090,27 @@
           return;
         }
 
-        toast('Collecting traces from second profile...');
-        await openTracesTab();
-        const targetTraces = await collectAllTraces();
-        let targetSteam64 = '';
-        try {
-          toast('Collecting Steam64 from second profile...');
-          const targetSteamResult = await fetchSteam64FromUi();
-          targetSteam64 = targetSteamResult.steam64 || '';
-        } catch {}
-        toast('Collecting IPs from second profile...');
-        const targetIps = await collectAllIps();
-        const targetProfile = getCurrentProfileSummary();
+        const targetData = await collectProfileComparisonData('second profile');
         const report = buildTraceCompareReport(
           state.sourceProfile,
-          targetProfile,
+          targetData.profile,
           state.sourceTraces || [],
-          targetTraces,
+          targetData.traces,
           state.sourceIps || [],
-          targetIps,
+          targetData.ips,
           state.targetUrl,
           state.sourceSteam64 || '',
-          targetSteam64
+          targetData.steam64
         );
         const returnUrl = state.sourceProfile?.url || '';
 
         if (returnUrl && returnUrl !== location.href) {
-          saveTraceCompareState({
-            stage: 'show-report',
-            sourceProfile: state.sourceProfile,
+          saveReportState(
+            state.sourceProfile,
             report,
-          });
+            'Trace comparison copied to clipboard.',
+            'Trace comparison ready. Copy failed.'
+          );
           location.href = returnUrl;
           return;
         }
@@ -958,6 +1120,132 @@
         const copied = await copyText(report);
         console.log(report);
         toast(copied ? 'Trace comparison copied to clipboard.' : 'Trace comparison ready. Copy failed.');
+        window.alert(report);
+      }
+
+      if (state.stage === 'alt-collect-source') {
+        const expectedSourceCfid = state.sourceProfile?.cfid || getProfileIdFromUrl(state.sourceProfile?.url);
+        const currentCfid = getCfId();
+        if (expectedSourceCfid && currentCfid && expectedSourceCfid !== currentCfid) {
+          return;
+        }
+
+        const sourceData = await collectProfileComparisonData('source account');
+
+        saveTraceCompareState({
+          stage: 'alt-collect-target',
+          sourceProfile: state.sourceProfile,
+          sourceTraces: sourceData.traces,
+          sourceIps: sourceData.ips,
+          sourceSteam64: sourceData.steam64,
+          altUrls: state.altUrls || [],
+          altResults: state.altResults || [],
+          currentAltIndex: 0,
+        });
+
+        const firstAltUrl = (state.altUrls || [])[0];
+        if (firstAltUrl) {
+          location.href = firstAltUrl;
+          return;
+        }
+
+        clearTraceCompareState();
+        toast('No Alt Accounts Found');
+        return;
+      }
+
+      if (state.stage === 'alt-collect-target') {
+        const altUrls = state.altUrls || [];
+        const currentAltIndex = state.currentAltIndex || 0;
+        const currentAltUrl = altUrls[currentAltIndex];
+        if (!currentAltUrl) {
+          const report = buildAltCompareReport(
+            state.sourceProfile,
+            state.sourceSteam64 || '',
+            state.altResults || []
+          );
+          const returnUrl = state.sourceProfile?.url || '';
+
+          if (returnUrl && returnUrl !== location.href) {
+            saveReportState(
+              state.sourceProfile,
+              report,
+              'Alt comparison copied to clipboard.',
+              'Alt comparison ready. Copy failed.'
+            );
+            location.href = returnUrl;
+            return;
+          }
+
+          clearTraceCompareState();
+          const copied = await copyText(report);
+          console.log(report);
+          toast(copied ? 'Alt comparison copied to clipboard.' : 'Alt comparison ready. Copy failed.');
+          window.alert(report);
+          return;
+        }
+
+        const expectedTargetCfid = getProfileIdFromUrl(currentAltUrl);
+        const currentCfid = getCfId();
+        if (expectedTargetCfid && currentCfid && expectedTargetCfid !== currentCfid) {
+          return;
+        }
+
+        const targetData = await collectProfileComparisonData(`alt account ${currentAltIndex + 1}`);
+        const matches = buildSharedMatchData(
+          state.sourceTraces || [],
+          targetData.traces,
+          state.sourceIps || [],
+          targetData.ips
+        );
+        const altResults = [
+          ...(state.altResults || []),
+          {
+            url: currentAltUrl,
+            steam64: targetData.steam64 || '',
+            sharedTraces: matches.sharedTraces,
+            sharedIps: matches.sharedIps,
+          },
+        ];
+        const nextAltIndex = currentAltIndex + 1;
+
+        if (nextAltIndex < altUrls.length) {
+          saveTraceCompareState({
+            stage: 'alt-collect-target',
+            sourceProfile: state.sourceProfile,
+            sourceTraces: state.sourceTraces || [],
+            sourceIps: state.sourceIps || [],
+            sourceSteam64: state.sourceSteam64 || '',
+            altUrls,
+            altResults,
+            currentAltIndex: nextAltIndex,
+          });
+          location.href = altUrls[nextAltIndex];
+          return;
+        }
+
+        const report = buildAltCompareReport(
+          state.sourceProfile,
+          state.sourceSteam64 || '',
+          altResults
+        );
+        const returnUrl = state.sourceProfile?.url || '';
+
+        if (returnUrl && returnUrl !== location.href) {
+          saveReportState(
+            state.sourceProfile,
+            report,
+            'Alt comparison copied to clipboard.',
+            'Alt comparison ready. Copy failed.'
+          );
+          location.href = returnUrl;
+          return;
+        }
+
+        clearTraceCompareState();
+        const copied = await copyText(report);
+        console.log(report);
+        toast(copied ? 'Alt comparison copied to clipboard.' : 'Alt comparison ready. Copy failed.');
         window.alert(report);
       }
 
@@ -992,7 +1280,7 @@
 
         const copied = await copyText(report);
         console.log(report);
-        toast(copied ? 'Trace comparison copied to clipboard.' : 'Trace comparison ready. Copy failed.');
+        toast(copied ? (state.successToast || 'Trace comparison copied to clipboard.') : (state.failureToast || 'Trace comparison ready. Copy failed.'));
         window.alert(report);
       }
     } catch (err) {
@@ -1080,12 +1368,13 @@
   const scheduleProfileRefresh = makeScheduler(async () => {
     ensureBanEntryButton();
     ensureTraceCompareButton();
+    ensureAltCompareButton();
     await resumeTraceCompareWorkflow();
   });
 
   // Mutation observers only react when relevant parts of the page are added.
   const COORD_OBSERVER_SELECTOR = 'span.text-code, .event-details';
-  const PROFILE_OBSERVER_SELECTOR = '.profile-container-left, .profile-container-item, .text-copyable.text-code, .profile-links, .profile-link, .profile-server-link, .profile-link-active, .c-page-header, .c-nav, .c-nav-item, .c-nav-link, .card-body.position-relative';
+  const PROFILE_OBSERVER_SELECTOR = '.profile-container-left, .profile-container-item, .text-copyable.text-code, .profile-links, .profile-link, .profile-server-link, .profile-link-active, .c-page-header, .c-nav, .c-nav-item, .c-nav-link, .card-body.position-relative, .card .card-body, .card-title, .table-responsive, .table.table-nowrap.table-centered, tbody tr, h5.text-truncate.font-size-14.m-0.text-dark, .team, a[href*="/profile/"]';
 
   scheduleCoordRefresh();
   scheduleProfileRefresh();
