@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CFTools Tools: Helper Script
 // @namespace    austin.cftools.vpp
-// @version      5.5
+// @version      5.7.0
 // @description  Adds coordinate copy tools, Discord ban entry creation, and profile trace comparison helpers for CFTools
 // @match        https://*cftools*/*
 // @match        https://*.cftools.cloud/*
@@ -742,6 +742,127 @@
     return Array.from(collected);
   }
 
+  const SIMILAR_TRACE_THRESHOLD = 0.72;
+  const MIN_SIMILAR_TRACE_LENGTH = 4;
+
+  function normalizeTraceForSimilarity(value) {
+    return (value || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '');
+  }
+
+  function getLevenshteinDistance(a, b) {
+    const source = a || '';
+    const target = b || '';
+
+    if (source === target) return 0;
+    if (!source.length) return target.length;
+    if (!target.length) return source.length;
+
+    const previous = Array.from({ length: target.length + 1 }, (_, index) => index);
+
+    for (let i = 1; i <= source.length; i += 1) {
+      let left = i;
+      let diagonal = i - 1;
+
+      for (let j = 1; j <= target.length; j += 1) {
+        const up = previous[j];
+        const cost = source[i - 1] === target[j - 1] ? 0 : 1;
+        const current = Math.min(
+          previous[j] + 1,
+          left + 1,
+          diagonal + cost
+        );
+
+        previous[j] = left;
+        left = current;
+        diagonal = up;
+      }
+
+      previous[target.length] = left;
+    }
+
+    return previous[target.length];
+  }
+
+  function getTraceSimilarityScore(sourceValue, targetValue) {
+    const source = normalizeTraceForSimilarity(sourceValue);
+    const target = normalizeTraceForSimilarity(targetValue);
+    if (!source || !target) return 0;
+    if (source === target) return 1;
+
+    const maxLength = Math.max(source.length, target.length);
+    if (!maxLength) return 0;
+
+    let score = 1 - (getLevenshteinDistance(source, target) / maxLength);
+    const shorter = source.length <= target.length ? source : target;
+    const longer = source.length > target.length ? source : target;
+    const sourceBase = source.replace(/\d+$/, '');
+    const targetBase = target.replace(/\d+$/, '');
+
+    // Treat obvious "same name with numeric suffix/prefix extension" patterns
+    // as strong fuzzy matches. These are common in reused DayZ names.
+    if (sourceBase && targetBase && sourceBase === targetBase && sourceBase.length >= MIN_SIMILAR_TRACE_LENGTH) {
+      score = Math.max(score, 0.95);
+    } else if (shorter.length >= MIN_SIMILAR_TRACE_LENGTH && longer.startsWith(shorter)) {
+      score = Math.max(score, 0.9);
+    } else if (shorter.length >= 6 && longer.includes(shorter)) {
+      score = Math.max(score, 0.82);
+    }
+
+    return score;
+  }
+
+  function buildSimilarTraceMatches(sourceTraces, targetTraces) {
+    const sourceEntries = Array.from(new Map(
+      sourceTraces.map(trace => [trace.toLowerCase(), {
+        raw: trace,
+        lower: trace.toLowerCase(),
+        normalized: normalizeTraceForSimilarity(trace),
+      }])
+    ).values());
+    const targetEntries = Array.from(new Map(
+      targetTraces.map(trace => [trace.toLowerCase(), {
+        raw: trace,
+        lower: trace.toLowerCase(),
+        normalized: normalizeTraceForSimilarity(trace),
+      }])
+    ).values());
+    const similarMatches = [];
+    const seenPairs = new Set();
+
+    for (const sourceEntry of sourceEntries) {
+      if (sourceEntry.normalized.length < MIN_SIMILAR_TRACE_LENGTH) continue;
+
+      let bestMatch = null;
+      for (const targetEntry of targetEntries) {
+        if (targetEntry.normalized.length < MIN_SIMILAR_TRACE_LENGTH) continue;
+        if (sourceEntry.lower === targetEntry.lower) continue;
+
+        const score = getTraceSimilarityScore(sourceEntry.raw, targetEntry.raw);
+        if (score < SIMILAR_TRACE_THRESHOLD) continue;
+
+        if (!bestMatch || score > bestMatch.score || (score === bestMatch.score && targetEntry.raw.localeCompare(bestMatch.raw) < 0)) {
+          bestMatch = {
+            raw: targetEntry.raw,
+            lower: targetEntry.lower,
+            score,
+          };
+        }
+      }
+
+      if (!bestMatch) continue;
+
+      const pairKey = `${sourceEntry.lower}||${bestMatch.lower}`;
+      if (seenPairs.has(pairKey)) continue;
+
+      seenPairs.add(pairKey);
+      similarMatches.push(`${sourceEntry.raw} - ${bestMatch.raw}`);
+    }
+
+    return similarMatches.sort((a, b) => a.localeCompare(b));
+  }
+
   function buildSharedMatchData(sourceTraces, targetTraces, sourceIps, targetIps) {
     const targetTraceSet = new Map(targetTraces.map(trace => [trace.toLowerCase(), trace]));
     const sharedTraces = sourceTraces
@@ -750,11 +871,13 @@
       .sort((a, b) => a.localeCompare(b));
 
     const uniqueSharedTraces = Array.from(new Set(sharedTraces));
+    const similarMatches = buildSimilarTraceMatches(sourceTraces, targetTraces);
     const targetIpSet = new Set(targetIps);
     const sharedIps = Array.from(new Set(sourceIps.filter(ip => targetIpSet.has(ip)))).sort((a, b) => a.localeCompare(b));
 
     return {
       sharedTraces: uniqueSharedTraces,
+      similarMatches,
       sharedIps,
     };
   }
@@ -792,8 +915,11 @@
     const targetAccountLine = targetSteam64 ? `${compareTargetUrl} (${targetSteam64})` : compareTargetUrl;
 
     return [
-      'Shared Traces:',
+      'Exact Traces:',
       ...(matches.sharedTraces.length ? matches.sharedTraces : ['None found']),
+      '',
+      'Similar Traces:',
+      ...(matches.similarMatches.length ? matches.similarMatches : ['None found']),
       '',
       'Shared IPs:',
       ...(matches.sharedIps.length ? matches.sharedIps : ['None found']),
@@ -825,8 +951,10 @@
 
       if (index > 0) lines.push('');
       lines.push(targetAccountLine);
-      lines.push('Shared Traces:');
+      lines.push('Exact Traces:');
       lines.push(...(result.sharedTraces.length ? result.sharedTraces : ['None found']));
+      lines.push('Similar Traces:');
+      lines.push(...(result.similarMatches.length ? result.similarMatches : ['None found']));
       lines.push('Shared IPs:');
       lines.push(...(result.sharedIps.length ? result.sharedIps : ['None found']));
     });
@@ -1204,6 +1332,7 @@
             url: currentAltUrl,
             steam64: targetData.steam64 || '',
             sharedTraces: matches.sharedTraces,
+            similarMatches: matches.similarMatches,
             sharedIps: matches.sharedIps,
           },
         ];
