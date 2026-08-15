@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CFTools Tools: Helper Script
 // @namespace    austin.cftools.vpp
-// @version      5.13.0
+// @version      5.14.0
 // @description  Adds coordinate copy tools, Discord ban entry creation, profile trace comparison helpers, and server-log shortcuts for CFTools
 // @match        https://*cftools*/*
 // @match        https://*.cftools.cloud/*
@@ -9,6 +9,7 @@
 // @updateURL    https://github.com/worstpotato/CFTools-TamperMonkey/raw/refs/heads/main/cftools-vpp.user.js
 // @downloadURL  https://github.com/worstpotato/CFTools-TamperMonkey/raw/refs/heads/main/cftools-vpp.user.js
 // @match        https://app.cftools.cloud/*
+// @noframes
 // @grant        GM_setClipboard
 // @grant        unsafeWindow
 // @grant        GM_getValue
@@ -30,23 +31,41 @@
 
   /*************** Toast ***************/
   // Small temporary message shown at the top of the page for status updates.
+  // Tracked explicitly so the stack closes up when an earlier toast expires.
+  // Deriving the offset from a live element count left gaps, and let a new toast
+  // reuse the slot of one that was still fading out.
+  const activeToasts = [];
+
+  function repositionToasts() {
+    activeToasts.forEach((el, index) => {
+      el.style.top = `${20 + (index * 42)}px`;
+    });
+  }
+
   function toast(msg, durationMs = 1500) {
     const t = document.createElement('div');
     t.textContent = msg;
-    const offset = 20 + (document.querySelectorAll('.codex-toast').length * 42);
     t.className = 'codex-toast';
     t.style.cssText = `
-      position: fixed; left: 50%; top: ${offset}px; transform: translateX(-50%);
+      position: fixed; left: 50%; top: 20px; transform: translateX(-50%);
       background: #111; color: #fff; padding: 8px 14px; border-radius: 999px;
       border: 1px solid #333; font: 13px system-ui,sans-serif;
       box-shadow: 0 8px 25px rgba(0,0,0,.3); z-index: 2147483647; opacity: 0;
-      transition: opacity .15s ease-out;
+      transition: opacity .15s ease-out, top .15s ease-out;
     `;
     document.body.appendChild(t);
+    activeToasts.push(t);
+    repositionToasts();
+
     requestAnimationFrame(() => (t.style.opacity = '1'));
     setTimeout(() => {
       t.style.opacity = '0';
-      setTimeout(() => t.remove(), 200);
+      setTimeout(() => {
+        t.remove();
+        const index = activeToasts.indexOf(t);
+        if (index !== -1) activeToasts.splice(index, 1);
+        repositionToasts();
+      }, 200);
     }, durationMs);
   }
 
@@ -362,16 +381,30 @@
   function makeScheduler(fn) {
     let queued = false;
 
+    // The flag clears only once fn has settled, so two async refreshes cannot
+    // interleave. It used to clear before fn even ran.
+    const run = () => {
+      Promise.resolve()
+        .then(fn)
+        .catch(err => {
+          console.error('Scheduled refresh failed:', err);
+        })
+        .finally(() => {
+          queued = false;
+        });
+    };
+
     return () => {
       if (queued) return;
       queued = true;
 
-      requestAnimationFrame(() => {
-        queued = false;
-        Promise.resolve(fn()).catch(err => {
-          console.error('Scheduled refresh failed:', err);
-        });
-      });
+      // requestAnimationFrame never fires in a background tab, which could leave a
+      // finished comparison report waiting until the user switched back.
+      if (document.hidden) {
+        setTimeout(run, 100);
+      } else {
+        requestAnimationFrame(run);
+      }
     };
   }
 
@@ -388,12 +421,18 @@
   // re-rendered <td> or a changed text node registers as a row change. It is
   // deliberately off for attribute mutations, where it would make every class
   // toggle anywhere inside a card look relevant.
-  function nodeMatchesOrContains(node, selector, includeAncestors = true) {
+  // includeDescendants scans the node's own subtree. That is the right cost for an
+  // added or removed node, where the subtree is the thing that changed, but it is
+  // wrong for a mutation *target*: the target can be any ancestor, and scanning its
+  // subtree made a change near the top of the document match on something unrelated
+  // far below it. Appending a toast to <body> matched, because <body> contains a
+  // profile container somewhere, so ordinary churn forced a full refresh per frame.
+  function nodeMatchesOrContains(node, selector, { includeAncestors = true, includeDescendants = true } = {}) {
     const element = getRelevantElement(node);
     if (!element) return false;
     if (element.matches(selector)) return true;
     if (includeAncestors && element.closest(selector)) return true;
-    return Boolean(element.querySelector(selector));
+    return includeDescendants ? Boolean(element.querySelector(selector)) : false;
   }
 
   // Helper used by observers to ignore unrelated DOM churn.
@@ -402,15 +441,25 @@
       const isRelevantType = mutation.type === 'attributes'
         || mutation.type === 'childList'
         || mutation.type === 'characterData';
+      if (!isRelevantType) continue;
 
-      if (
-        isRelevantType
-        && nodeMatchesOrContains(mutation.target, selector, mutation.type !== 'attributes')
-      ) {
+      // For the target itself: an attribute change is only relevant on a matching
+      // element, while a childList/characterData change is also relevant inside one
+      // (a re-rendered <td> or a changed text node registers as a row change).
+      if (nodeMatchesOrContains(mutation.target, selector, {
+        includeAncestors: mutation.type !== 'attributes',
+        includeDescendants: false,
+      })) {
         return true;
       }
 
       for (const node of mutation.addedNodes) {
+        if (nodeMatchesOrContains(node, selector)) return true;
+      }
+
+      // Removals matter too: the ensure* helpers tear their buttons down when the
+      // section they attach to disappears.
+      for (const node of mutation.removedNodes) {
         if (nodeMatchesOrContains(node, selector)) return true;
       }
     }
@@ -781,10 +830,16 @@
   // The spread comes after createdAt so a re-save (see the failure counter below)
   // keeps the original timestamp and does not extend the TTL.
   function saveServerLogsFilter(filter) {
-    localStorage.setItem(SERVER_LOGS_FILTER_KEY, JSON.stringify({
-      createdAt: Date.now(),
-      ...filter,
-    }));
+    try {
+      localStorage.setItem(SERVER_LOGS_FILTER_KEY, JSON.stringify({
+        createdAt: Date.now(),
+        ...filter,
+      }));
+      return true;
+    } catch (err) {
+      console.error('Could not save the server-log filter:', err);
+      return false;
+    }
   }
 
   // A pending filter is only ever valid for the server it was created from.
@@ -807,7 +862,11 @@
   }
 
   function clearServerLogsFilter() {
-    localStorage.removeItem(SERVER_LOGS_FILTER_KEY);
+    try {
+      localStorage.removeItem(SERVER_LOGS_FILTER_KEY);
+    } catch (err) {
+      console.error('Could not clear the server-log filter:', err);
+    }
   }
 
   // Counts failed auto-fill attempts so a filter that cannot be mapped stops
@@ -1179,14 +1238,23 @@
   }
 
   // Finds left-side profile links like Overview / Identities / Activities.
+  // This deliberately does not require `text-muted`: the active link can drop that
+  // class, and requiring it made clicking the section you are already on time out
+  // after 15s and abort the whole comparison. Server rows live in the same list, so
+  // they are excluded by class instead.
   function findProfileLink(label) {
-    const links = document.querySelectorAll('.profile-links .profile-link.text-muted');
+    const links = document.querySelectorAll('.profile-links .profile-link');
     for (const link of links) {
-      if ((link.textContent || '').trim().toLowerCase() === label.toLowerCase()) {
+      if (link.classList.contains('profile-server-link')) continue;
+      if (getCleanText(link).toLowerCase() === label.toLowerCase()) {
         return link;
       }
     }
     return null;
+  }
+
+  function getSidebarServerLinks() {
+    return Array.from(document.querySelectorAll('.profile-links .profile-server-link'));
   }
 
   function getActiveServerLink() {
@@ -1195,6 +1263,15 @@
 
   function hasServerEntryBadge(link) {
     return Boolean(link?.querySelector('.badge.badge-primary .fa-user'));
+  }
+
+  // Records the active server as data rather than as an element reference, so it can
+  // be re-resolved after the SPA re-renders. See findServerLink.
+  function getActiveServerEntry() {
+    const links = getSidebarServerLinks();
+    const index = links.findIndex(link => link.classList.contains('profile-link-active'));
+    if (index === -1) return null;
+    return { name: getCleanText(links[index]), index };
   }
 
   // Section links are Overview / Identities / Activities. The :not() guard keeps
@@ -1212,13 +1289,7 @@
   // Some profile variants do not mark the server row itself as active.
   // In those cases, the blue person badge still tells us which server has a usable player entry.
   function getServerEntryLink() {
-    const links = document.querySelectorAll('.profile-links .profile-server-link');
-    for (const link of links) {
-      if (hasServerEntryBadge(link)) {
-        return link;
-      }
-    }
-    return null;
+    return getSidebarServerLinks().find(hasServerEntryBadge) || null;
   }
 
   function getPreferredServerLink() {
@@ -1299,33 +1370,46 @@
   // Temporarily switches to Identities, reads Steam64, then returns to the active server view.
   // This only clicks navigation links, not destructive action buttons.
   async function fetchSteam64FromUi() {
-    const activeServer = getActiveServerLink();
+    // Record where to return to as data, not as element references: the nodes
+    // captured here are detached once the SPA re-renders, and clicking a detached
+    // node is a silent no-op that used to strand the user on Identities.
+    const activeServerEntry = getActiveServerEntry();
     const preferredServerName = getPreferredServerName();
-    const identitiesLink = findProfileLink('Identities');
-    const overviewLink = findProfileLink('Overview');
     const activeTopNav = getActiveTopNavLabel();
+    const identitiesLink = findProfileLink('Identities');
     if (!identitiesLink) {
       throw new Error('Could not find the Identities tab.');
     }
 
-    identitiesLink.click();
-    await delay(250);
+    clickElement(identitiesLink);
 
-    if (findTopNavLink('Identities')) {
-      const identitiesTopNav = findTopNavLink('Identities');
-      clickElement(identitiesTopNav);
+    // The Identities sub-nav renders asynchronously, so wait for it rather than
+    // guessing with a fixed delay.
+    let identitiesTopNav = null;
+    try {
+      identitiesTopNav = await waitForElement(() => findTopNavLink('Identities'), 3000);
+    } catch {}
+
+    if (identitiesTopNav) {
+      if (getActiveTopNavLabel().toLowerCase() !== 'identities') {
+        clickElement(identitiesTopNav);
+      }
+      // Only read once Identities is genuinely the active view. Reading earlier can
+      // pick up the previous view's still-mounted input, i.e. another player's id.
       await waitForElement(() => getActiveTopNavLabel().toLowerCase() === 'identities', 15000);
     }
 
     const steam64 = await waitForSteam64();
 
-    if (activeTopNav && activeTopNav.toLowerCase() === 'traces' && findTopNavLink('Traces')) {
+    if (activeTopNav && activeTopNav.toLowerCase() === 'traces') {
       const tracesTopNav = findTopNavLink('Traces');
-      clickElement(tracesTopNav);
-    } else if (activeServer) {
-      activeServer.click();
-    } else if (overviewLink) {
-      clickElement(overviewLink);
+      if (tracesTopNav) clickElement(tracesTopNav);
+    } else if (activeServerEntry) {
+      const serverLink = findServerLink(activeServerEntry);
+      if (serverLink) clickElement(serverLink);
+    } else {
+      const overviewLink = findProfileLink('Overview');
+      if (overviewLink) clickElement(overviewLink);
     }
 
     return {
@@ -1335,9 +1419,12 @@
   }
 
   // Builds the Discord-friendly ban entry text that gets copied to the clipboard.
-  function buildBanEntry(steam64, serverName = '', reason = '', term = '', ignName = '') {
+  // profileUrl is passed in by the caller because the Steam64 lookup navigates to
+  // Identities first; reading location.href here recorded the sub-route instead of
+  // the profile the entry is about.
+  function buildBanEntry(steam64, serverName = '', reason = '', term = '', ignName = '', profileUrl = '') {
     const ign = ignName || getProfileName();
-    const cftUrl = location.href;
+    const cftUrl = profileUrl || location.href;
     const server = serverName || getPreferredServerName();
 
     return [
@@ -1377,15 +1464,28 @@
   }
 
   // Every saved state gets a timestamp so it can expire automatically.
+  // Storage can be full or blocked, and an exception here used to escape straight
+  // out of a click handler with no explanation.
   function saveTraceCompareState(state) {
-    sessionStorage.setItem(TRACE_COMPARE_KEY, JSON.stringify({
-      createdAt: Date.now(),
-      ...state,
-    }));
+    try {
+      sessionStorage.setItem(TRACE_COMPARE_KEY, JSON.stringify({
+        createdAt: Date.now(),
+        ...state,
+      }));
+      return true;
+    } catch (err) {
+      console.error('Could not save trace comparison state:', err);
+      toast('Could not save comparison progress.');
+      return false;
+    }
   }
 
   function clearTraceCompareState() {
-    sessionStorage.removeItem(TRACE_COMPARE_KEY);
+    try {
+      sessionStorage.removeItem(TRACE_COMPARE_KEY);
+    } catch (err) {
+      console.error('Could not clear trace comparison state:', err);
+    }
   }
 
   // Used to confirm we resumed on the profile we expected to be on.
@@ -1463,6 +1563,11 @@
 
   // Some CFTools UI elements behave more reliably with a real mouse-event sequence
   // than with a plain element.click(), so this is used for navigation-style controls.
+  //
+  // It dispatches the sequence *instead of* calling element.click(), not in addition
+  // to it. Doing both ran every handler twice, which double-navigated SPA links and
+  // could re-toggle a modal straight back closed, and it delivered the events in the
+  // wrong order (click, mousedown, mouseup, click).
   function clickElement(element) {
     if (!element) return false;
 
@@ -1475,10 +1580,6 @@
       element.scrollIntoView({ block: 'center', inline: 'nearest' });
     } catch {}
 
-    try {
-      element.click();
-    } catch {}
-
     element.dispatchEvent(new MouseEvent('mousedown', mouseOptions));
     element.dispatchEvent(new MouseEvent('mouseup', mouseOptions));
     return element.dispatchEvent(new MouseEvent('click', mouseOptions));
@@ -1486,30 +1587,38 @@
 
   // Finds the server links in the left profile sidebar that show the blue person badge,
   // which means the player has server-specific data available there.
-  function getServerEntryNames() {
-    const names = new Set();
-    const links = document.querySelectorAll('.profile-links .profile-server-link');
+  // Entries keep their position in the sidebar so that two servers sharing a visible
+  // name are still visited separately; a name-keyed Set collapsed them into one and
+  // silently skipped the second server's IP history.
+  function getServerEntries() {
+    const entries = [];
 
-    for (const link of links) {
-      const hasEntryBadge = Boolean(link.querySelector('.badge.badge-primary .fa-user'));
-      if (!hasEntryBadge) continue;
+    getSidebarServerLinks().forEach((link, index) => {
+      if (!hasServerEntryBadge(link)) return;
 
       const name = getCleanText(link);
-      if (name) names.add(name);
-    }
+      if (name) entries.push({ name, index });
+    });
 
-    return Array.from(names);
+    return entries;
   }
 
-  function findServerLinkByName(serverName) {
-    const links = document.querySelectorAll('.profile-links .profile-server-link');
-    for (const link of links) {
-      const text = getCleanText(link);
-      if (text === serverName || text.startsWith(serverName)) {
-        return link;
-      }
-    }
-    return null;
+  // Re-resolves an entry after the sidebar has re-rendered. Position is preferred and
+  // confirmed by name; an exact name match is the fallback if the list reordered.
+  // Unanchored prefix matching is gone: it resolved "KKCherno#1" to "KKCherno#10" and
+  // collected the wrong server's IPs -- the same trap the server-logs name lookup
+  // already guards against with isServerNameBoundary.
+  function findServerLink(entry) {
+    if (!entry) return null;
+
+    const links = getSidebarServerLinks();
+    const byIndex = links[entry.index];
+    if (byIndex && getCleanText(byIndex) === entry.name) return byIndex;
+
+    const exact = links.filter(link => getCleanText(link) === entry.name);
+    if (exact.length === 1) return exact[0];
+
+    return byIndex || null;
   }
 
   function findIpHistoryButton() {
@@ -1558,32 +1667,42 @@
     await waitForElement(() => !getIpHistoryModal(), 10000);
   }
 
-  async function openServerEntry(serverName, timeoutMs = 15000) {
+  // Opens a server entry and waits for its IP history button to be ready.
+  // Clicks are capped and skipped when the entry is already open, so a slow render
+  // no longer turns into a click storm against the SPA router.
+  async function openServerEntry(entry, timeoutMs = 15000) {
     const started = Date.now();
+    const maxClicks = 3;
+    let clicks = 0;
 
     while (Date.now() - started < timeoutMs) {
-      const serverLink = await waitForElement(() => findServerLinkByName(serverName), 5000);
+      const serverLink = await waitForElement(() => findServerLink(entry), 5000);
       const ipButtonBefore = findIpHistoryButton();
-      clickElement(serverLink);
+      const isAlreadyOpen = serverLink.classList.contains('profile-link-active') && ipButtonBefore;
+
+      if (!isAlreadyOpen) {
+        clicks += 1;
+        clickElement(serverLink);
+      }
 
       try {
         await waitForElement(() => {
-          const refreshedServerLink = findServerLinkByName(serverName);
-          const activeServerName = getActiveServerName();
-          const isActive = Boolean(refreshedServerLink?.classList.contains('profile-link-active'));
           const ipButton = findIpHistoryButton();
-          return ((isActive || activeServerName === serverName) && ipButton)
-            || (ipButton && ipButton !== ipButtonBefore)
-            ? ipButton
-            : null;
+          if (!ipButton) return null;
+
+          const refreshedServerLink = findServerLink(entry);
+          const isActive = Boolean(refreshedServerLink?.classList.contains('profile-link-active'))
+            || getActiveServerName() === entry.name;
+          return (isActive || ipButton !== ipButtonBefore) ? ipButton : null;
         }, 4000);
         return;
       } catch {}
 
+      if (clicks >= maxClicks) break;
       await delay(250);
     }
 
-    throw new Error(`Timed out opening server entry for ${serverName}.`);
+    throw new Error(`Timed out opening server entry for ${entry.name}.`);
   }
 
   // Goes back to Overview, then checks every server entry that has the blue badge
@@ -1597,18 +1716,30 @@
         || document.querySelector('.profile-links .profile-server-link');
     }, 15000);
 
-    const serverNames = getServerEntryNames();
-    for (const serverName of serverNames) {
-      await openServerEntry(serverName);
+    for (const entry of getServerEntries()) {
+      // One slow or broken server must not discard the IPs already collected from
+      // every other server, which is what an escaping timeout used to do.
+      try {
+        await openServerEntry(entry);
 
-      const ipButton = await waitForElement(() => findIpHistoryButton(), 10000);
-      clickElement(ipButton);
+        const ipButton = await waitForElement(() => findIpHistoryButton(), 10000);
+        clickElement(ipButton);
 
-      const modal = await waitForElement(() => getIpHistoryModal(), 10000);
-      const ips = extractIpsFromModal(modal);
-      ips.forEach(ip => collected.add(ip));
+        const modal = await waitForElement(() => getIpHistoryModal(), 10000);
+        extractIpsFromModal(modal).forEach(ip => collected.add(ip));
 
-      await closeIpHistoryModal(modal);
+        await closeIpHistoryModal(modal);
+      } catch (err) {
+        console.warn(`Skipped IP history for ${entry.name}:`, err);
+
+        // Leave the page usable for the next server even if we bailed mid-modal.
+        const strandedModal = getIpHistoryModal();
+        if (strandedModal) {
+          try {
+            await closeIpHistoryModal(strandedModal);
+          } catch {}
+        }
+      }
     }
 
     return Array.from(collected);
@@ -1618,10 +1749,11 @@
   async function openTracesTab() {
     await waitForPageReady();
     await clickProfileLink('Identities');
-    await waitForElement(() => findTopNavLink('Traces'), 15000);
 
     const tracesNav = await waitForElement(() => findTopNavLink('Traces'), 15000);
-    tracesNav.click();
+    if (getActiveTopNavLabel().toLowerCase() !== 'traces') {
+      clickElement(tracesNav);
+    }
     await waitForElement(() => getActiveTopNavLabel().toLowerCase() === 'traces', 15000);
     await waitForElement(() => extractTracesFromVm().length || extractTracesFromPage().length || document.querySelector('.btn-group.btn-group-sm'), 15000);
   }
@@ -1861,7 +1993,7 @@
   }
 
   // Finds the traces pagination group by looking for the left/right arrow buttons and an active page.
-  function getTracePaginationNextButton() {
+  function getTracePaginationGroup() {
     const groups = document.querySelectorAll('.btn-group.btn-group-sm');
     for (const group of groups) {
       const buttons = group.querySelectorAll('button');
@@ -1870,15 +2002,23 @@
       const lastArrow = buttons[buttons.length - 1].querySelector('.fa-arrow-right');
       const activePage = group.querySelector('.btn-primary h5');
       if (!firstArrow || !lastArrow || !activePage) continue;
-      return buttons[buttons.length - 1];
+      return group;
     }
     return null;
   }
 
+  function getTracePaginationNextButton(group = getTracePaginationGroup()) {
+    if (!group) return null;
+    const buttons = group.querySelectorAll('button');
+    return buttons[buttons.length - 1] || null;
+  }
+
   // Current page number, used to detect when pagination really advanced.
-  function getTracePageNumber() {
-    const activePage = document.querySelector('.btn-group.btn-group-sm .btn-primary h5');
-    return getCleanText(activePage);
+  // It reads from the same group whose button we click; a document-wide lookup
+  // could watch a different paginated widget rendered higher up the page.
+  function getTracePageNumber(group = getTracePaginationGroup()) {
+    if (!group) return '';
+    return getCleanText(group.querySelector('.btn-primary h5'));
   }
 
   // Walks every traces page and collects a de-duplicated set of names.
@@ -1897,6 +2037,7 @@
 
     debugLog('[CFTools Tools] Trace debug: falling back to pagination');
     const collected = new Set();
+    const seenPages = new Set();
     let pageGuard = 0;
 
     while (pageGuard < 200) {
@@ -1905,23 +2046,41 @@
       const pageTraces = extractTracesFromPage({ includeIgnored: false });
       pageTraces.forEach(trace => collected.add(trace));
 
-      const nextButton = getTracePaginationNextButton();
+      const group = getTracePaginationGroup();
+      const nextButton = getTracePaginationNextButton(group);
       if (!nextButton) break;
 
       const disabled = nextButton.disabled || nextButton.classList.contains('disabled');
       if (disabled) break;
 
-      const beforeSnapshot = extractTracesFromPage().join('|');
-      const beforePageNumber = getTracePageNumber();
-      nextButton.click();
+      const beforePageNumber = getTracePageNumber(group);
 
-      // Wait until either the page number changed or the visible results changed.
-      await waitForElement(() => {
-        const afterSnapshot = extractTracesFromPage().join('|');
-        const afterPageNumber = getTracePageNumber();
-        return (afterPageNumber && afterPageNumber !== beforePageNumber)
-          || (afterSnapshot && afterSnapshot !== beforeSnapshot);
-      }, 10000);
+      // Stop if pagination wrapped back to a page we already read instead of
+      // disabling the next button, rather than looping to the 200-page guard.
+      if (beforePageNumber) {
+        if (seenPages.has(beforePageNumber)) break;
+        seenPages.add(beforePageNumber);
+      }
+
+      const beforeSnapshot = extractTracesFromPage().join('|');
+      clickElement(nextButton);
+
+      try {
+        // Wait until either the page number changed or the visible results changed.
+        await waitForElement(() => {
+          const afterGroup = getTracePaginationGroup();
+          const afterPageNumber = getTracePageNumber(afterGroup);
+          const afterSnapshot = extractTracesFromPage().join('|');
+          return (afterPageNumber && afterPageNumber !== beforePageNumber)
+            || (afterSnapshot && afterSnapshot !== beforeSnapshot);
+        }, 10000);
+      } catch {
+        // A stalled page should end pagination with what we already have instead of
+        // throwing away the whole comparison.
+        debugLog('[CFTools Tools] Trace debug: pagination stalled, keeping partial results');
+        console.warn('Traces pagination stalled; keeping the results collected so far.');
+        break;
+      }
 
       await delay(250);
     }
@@ -1971,16 +2130,20 @@
     return previous[target.length];
   }
 
-  function getTraceSimilarityScore(sourceValue, targetValue) {
-    const source = normalizeTraceForSimilarity(sourceValue);
-    const target = normalizeTraceForSimilarity(targetValue);
+  // Takes already-normalized values. buildSimilarTraceMatches precomputes them once
+  // per trace and reuses them, because this runs once per source/target pair -- on
+  // two 600-name profiles that is 360k pairs, and re-normalizing both strings inside
+  // the loop was the bulk of the cost.
+  //
+  // Scores below SIMILAR_TRACE_THRESHOLD are only ever compared against that
+  // threshold, so they are allowed to be approximate.
+  function getNormalizedTraceSimilarity(source, target) {
     if (!source || !target) return 0;
     if (source === target) return 1;
 
     const maxLength = Math.max(source.length, target.length);
     if (!maxLength) return 0;
 
-    let score = 1 - (getLevenshteinDistance(source, target) / maxLength);
     const shorter = source.length <= target.length ? source : target;
     const longer = source.length > target.length ? source : target;
     const sourceBase = source.replace(/\d+$/, '');
@@ -1988,15 +2151,26 @@
 
     // Treat obvious "same name with numeric suffix/prefix extension" patterns
     // as strong fuzzy matches. These are common in reused DayZ names.
+    // They are checked first because they stay valid even when the length gap is
+    // wide enough to rule out a good edit distance.
+    let score = 0;
     if (sourceBase && targetBase && sourceBase === targetBase && sourceBase.length >= MIN_SIMILAR_TRACE_LENGTH) {
-      score = Math.max(score, 0.95);
+      score = 0.95;
     } else if (shorter.length >= MIN_SIMILAR_TRACE_LENGTH && longer.startsWith(shorter)) {
-      score = Math.max(score, 0.9);
+      score = 0.9;
     } else if (shorter.length >= 6 && longer.includes(shorter)) {
-      score = Math.max(score, 0.82);
+      score = 0.82;
     }
 
-    return score;
+    // Edit distance is at least the length difference, so the best score it could
+    // possibly return is capped. Skip the O(n*m) matrix when that cap cannot beat
+    // what we already have, or cannot reach the threshold at all.
+    const distanceCeiling = 1 - (Math.abs(source.length - target.length) / maxLength);
+    if (distanceCeiling <= score || distanceCeiling < SIMILAR_TRACE_THRESHOLD) {
+      return score;
+    }
+
+    return Math.max(score, 1 - (getLevenshteinDistance(source, target) / maxLength));
   }
 
   function buildSimilarTraceMatches(sourceTraces, targetTraces) {
@@ -2025,7 +2199,7 @@
         if (targetEntry.normalized.length < MIN_SIMILAR_TRACE_LENGTH) continue;
         if (sourceEntry.lower === targetEntry.lower) continue;
 
-        const score = getTraceSimilarityScore(sourceEntry.raw, targetEntry.raw);
+        const score = getNormalizedTraceSimilarity(sourceEntry.normalized, targetEntry.normalized);
         if (score < SIMILAR_TRACE_THRESHOLD) continue;
 
         if (!bestMatch || score > bestMatch.score || (score === bestMatch.score && targetEntry.raw.localeCompare(bestMatch.raw) < 0)) {
@@ -2069,9 +2243,17 @@
   }
 
   async function collectProfileComparisonData(profileLabel) {
-    toast(`Collecting traces from ${profileLabel}...`);
-    await openTracesTab();
-    const traces = await collectAllTraces();
+    // Each section is isolated so a failure in one still produces a partial report
+    // rather than aborting the whole comparison and clearing its saved state.
+    let traces = [];
+    try {
+      toast(`Collecting traces from ${profileLabel}...`);
+      await openTracesTab();
+      traces = await collectAllTraces();
+    } catch (err) {
+      console.warn(`Trace collection failed for ${profileLabel}:`, err);
+      toast(`Could not read traces from ${profileLabel}.`);
+    }
 
     let steam64 = '';
     try {
@@ -2080,8 +2262,14 @@
       steam64 = steamResult.steam64 || '';
     } catch {}
 
-    toast(`Collecting IPs from ${profileLabel}...`);
-    const ips = await collectAllIps();
+    let ips = [];
+    try {
+      toast(`Collecting IPs from ${profileLabel}...`);
+      ips = await collectAllIps();
+    } catch (err) {
+      console.warn(`IP collection failed for ${profileLabel}:`, err);
+      toast(`Could not read IPs from ${profileLabel}.`);
+    }
 
     return {
       profile: getCurrentProfileSummary(),
@@ -2169,8 +2357,17 @@
 
   // Only allow compare targets that look like real CFTools profile URLs.
   function normalizeCompareTargetUrl(rawUrl) {
+    const trimmed = (rawUrl || '').trim();
+    if (!trimmed) return null;
+
+    // Require an absolute or root-relative URL. Resolving something like
+    // "app.cftools.cloud/profile/123" against the current origin produced
+    // "<origin>/app.cftools.cloud/profile/123", which still passed the host and id
+    // checks below and then navigated to a dead page.
+    if (!/^https?:\/\//i.test(trimmed) && !trimmed.startsWith('/')) return null;
+
     try {
-      const url = new URL(rawUrl, location.origin);
+      const url = new URL(trimmed, location.origin);
       const hostname = url.hostname.toLowerCase();
       const isCfToolsHost = hostname === 'cftools.cloud'
         || hostname === 'app.cftools.cloud'
@@ -2227,15 +2424,33 @@
     return btn;
   }
 
+  const ALT_ROW_LABEL_RE = /^Potential alternate accounts$/i;
+  let cachedAltRow = null;
+
+  function isPotentialAltRow(row) {
+    return Boolean(row)
+      && row.isConnected
+      && ALT_ROW_LABEL_RE.test(getCleanText(row.querySelector('td h5')));
+  }
+
+  // Cached because this runs on every profile refresh and the uncached form walks
+  // every row of every table on the page. Unlike querySelector, querySelectorAll
+  // cannot short-circuit, so a large activity table made this the most expensive
+  // part of a refresh.
   function getPotentialAltRow() {
+    if (isPotentialAltRow(cachedAltRow)) return cachedAltRow;
+
+    cachedAltRow = null;
     const rows = document.querySelectorAll('.card .card-body tbody tr');
     for (const row of rows) {
       const label = getCleanText(row.querySelector('td h5'));
-      if (/^Potential alternate accounts$/i.test(label)) {
-        return row;
+      if (ALT_ROW_LABEL_RE.test(label)) {
+        cachedAltRow = row;
+        break;
       }
     }
-    return null;
+
+    return cachedAltRow;
   }
 
   function getGeneralCardBody() {
@@ -2595,7 +2810,12 @@
           return;
         }
 
-        if ((Date.now() - state.readySince) < 800) {
+        const settledFor = Date.now() - state.readySince;
+        if (settledFor < 800) {
+          // Re-arm rather than relying solely on the timer set when readySince was
+          // first recorded; without this the report could stall if no further
+          // mutations arrived.
+          setTimeout(() => scheduleProfileRefresh(), Math.max(100, 900 - settledFor));
           return;
         }
 
@@ -2638,7 +2858,9 @@
     btn.addEventListener('mouseleave', () => (btn.style.background = '#c0392b'));
     btn.addEventListener('click', async () => {
       let steam64 = '';
-      let ignName = getProfileName();
+      // Captured before the Steam64 lookup navigates away from this view.
+      const profileUrl = location.href;
+      const ignName = getProfileName();
       let serverName = getPreferredServerName();
       // Reason and term are manual because they depend on staff judgment.
       const reason = window.prompt('Enter ban reason:', '') || '';
@@ -2654,7 +2876,7 @@
         toast('Could not fetch Steam64 from Identities. Check console, copying template anyway.');
       }
 
-      const banEntry = buildBanEntry(steam64, serverName, reason, term, ignName);
+      const banEntry = buildBanEntry(steam64, serverName, reason, term, ignName, profileUrl);
       const copied = await copyText(banEntry);
       toast(copied ? 'Ban entry template copied.' : 'Could not copy ban entry.');
     });
@@ -2779,7 +3001,14 @@
 
   // Mutation observers only react when relevant parts of the page are added.
   const COORD_OBSERVER_SELECTOR = 'span.text-code, .event-details';
-  const PROFILE_OBSERVER_SELECTOR = '.profile-container-left, .profile-container-item, .text-copyable.text-code, .profile-links, .profile-link, .profile-server-link, .profile-link-active, .c-page-header, .c-nav, .c-nav-item, .c-nav-link, .card-body.position-relative, .card .card-body, .card-title, .table-responsive, .table.table-nowrap.table-centered, tbody tr, h5.text-truncate.font-size-14.m-0.text-dark, .team, a[href*="/profile/"]';
+  // Narrowed to the containers the ensure* helpers actually anchor to. The previous
+  // list carried catch-alls -- `tbody tr`, `a[href*="/profile/"]`, `.table-responsive`,
+  // `.team` -- that match somewhere on every profile page, so nearly every mutation
+  // counted as relevant. `.card .card-body` is now just `.card-body`: matching one
+  // class is cheaper and equivalent here.
+  // `.profile-link-active` needs no entry: class changes land on an element that
+  // already matches `.profile-link` / `.profile-server-link`.
+  const PROFILE_OBSERVER_SELECTOR = '.profile-container-left, .profile-container-item, .mobile-profile-container-item, .text-copyable.text-code, .profile-links, .profile-link, .profile-server-link, .c-page-header, .c-nav, .c-nav-item, .c-nav-link, .page-title-card, .card-body, .card-title';
   const SERVER_LOGS_OBSERVER_SELECTOR = 'table, tbody, tr';
 
   scheduleCoordRefresh();
