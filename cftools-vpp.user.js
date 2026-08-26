@@ -903,20 +903,34 @@
       .join('');
   }
 
+  // The qualification test on its own: does this row describe an event we can jump
+  // to? Split out of getServerLogsRowContext so a row that already has a button can
+  // be re-validated without also paying for timestamp parsing and coordinate
+  // extraction, which addServerLogsButtons would then throw away.
+  function isServerLogsActionCell(cell) {
+    const bold = cell?.querySelector('b.text-code');
+    if (!bold) return false;
+    return SERVER_LOGS_EVENT_RE.test(getBoldDirectText(bold));
+  }
+
+  function findServerLogsActionCell(row) {
+    if (!row) return null;
+
+    const cells = row.querySelectorAll('td');
+    if (cells.length < 2) return null;
+
+    return Array.from(cells).find(isServerLogsActionCell) || null;
+  }
+
   // knownServerId lets a caller that is walking many rows resolve the server once
   // per table instead of once per row.
   function getServerLogsRowContext(row, knownServerId = null) {
     if (!row) return null;
 
     const table = row.closest('table');
-    const cells = row.querySelectorAll('td');
-    if (!table || cells.length < 2) return null;
+    if (!table) return null;
 
-    const actionCell = Array.from(cells).find(cell => {
-      const bold = cell.querySelector('b.text-code');
-      if (!bold) return false;
-      return SERVER_LOGS_EVENT_RE.test(getBoldDirectText(bold));
-    });
+    const actionCell = findServerLogsActionCell(row);
     if (!actionCell) return null;
 
     const bold = actionCell.querySelector('b.text-code');
@@ -1056,17 +1070,23 @@
       const tableServerId = pageServerId || getServerLogsServerIdFromTable(table);
 
       table.querySelectorAll('tr').forEach(row => {
-        const context = getServerLogsRowContext(row, tableServerId);
         const existing = row.querySelector('[data-server-logs-btn]');
 
-        if (!context) {
-          if (existing) existing.remove();
+        // Rows that already have a button are the steady state, and the button
+        // reads its row again on click, so an already-placed one stays correct
+        // even if the row's contents changed underneath it. Re-checking only the
+        // cell the button already sits in keeps this loop from parsing a
+        // timestamp and walking event details for every row on every table
+        // mutation, only to discard the result.
+        // If the action moved to a different cell this drops the button, and the
+        // next pass re-adds it in the right place.
+        if (existing) {
+          if (!isServerLogsActionCell(existing.closest('td'))) existing.remove();
           return;
         }
 
-        // The button reads its row again on click, so an already-placed one
-        // stays correct even if the row's contents changed underneath it.
-        if (existing) return;
+        const context = getServerLogsRowContext(row, tableServerId);
+        if (!context) return;
 
         const button = createServerLogsButton();
         debugLog('[CFTools Tools] Server Logs debug: adding button', {
@@ -2959,15 +2979,25 @@
   }
 
   // Profile-side refreshes are also debounced so repeated rerenders do not spam DOM work.
-  const scheduleProfileRefresh = makeScheduler(async () => {
+  // The scheduler holds its debounce flag until the callback settles, so these
+  // callbacks stay synchronous and the long-running jobs are started detached.
+  // Awaiting resumeTraceCompareWorkflow here would block every refresh for the
+  // minutes a comparison takes, leaving the buttons unattached once it ends.
+  // Both jobs already guard their own reentrancy (traceCompareRunning /
+  // serverLogsFilterApplying), so nothing can overlap itself.
+  const scheduleProfileRefresh = makeScheduler(() => {
     ensureBanEntryButton();
     ensureTraceCompareButton();
     ensureAltCompareButton();
-    await resumeTraceCompareWorkflow();
+    resumeTraceCompareWorkflow().catch(err => {
+      console.error('Trace comparison failed:', err);
+    });
   });
-  const scheduleServerLogsRefresh = makeScheduler(async () => {
+  const scheduleServerLogsRefresh = makeScheduler(() => {
     if (isServerLogsPage()) {
-      await applyPendingServerLogsFilter();
+      applyPendingServerLogsFilter().catch(err => {
+        console.error('Server-log filter auto-fill failed:', err);
+      });
       return;
     }
 
