@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CFTools Tools: Helper Script
 // @namespace    austin.cftools.vpp
-// @version      5.24.0
+// @version      5.25.0
 // @description  Adds coordinate copy tools, Discord ban entry creation, profile trace comparison helpers, and server-log shortcuts for CFTools
 // @match        https://*cftools*/*
 // @match        https://*.cftools.cloud/*
@@ -4164,17 +4164,15 @@
     const flaggedCfids = new Set();
     const lines = [];
 
+    // A server only earns a section by having someone to report. A sweep of a dozen
+    // servers is mostly quiet ones, and listing them all buries the hits.
     servers.forEach(server => {
-      lines.push('');
-      lines.push(server.name);
-
       const flagged = (serverPlayers[server.id] || [])
         .filter(player => (banMatches[player.cfid] || []).length);
+      if (!flagged.length) return;
 
-      if (!flagged.length) {
-        lines.push('None found');
-        return;
-      }
+      lines.push('');
+      lines.push(server.name);
 
       flagged.forEach(player => {
         flaggedCfids.add(player.cfid);
@@ -4186,6 +4184,11 @@
         });
       });
     });
+
+    if (!lines.length) {
+      lines.push('');
+      lines.push('None found');
+    }
 
     return [
       'Cheater Ban Scan',

@@ -158,7 +158,8 @@ server you have access to. Tick the ones you want and press `Scan`, and it will:
 1. Open each selected server's dashboard in turn and collect its banned players.
 2. Visit every one of those profiles once, even if the player was on several of the
    servers.
-3. Return to the page you started from with a report grouped by server.
+3. Return to the page you started from with a report grouped by server. Only servers
+   that turned up a cheater ban get a section.
 
 Your last selection is remembered and pre-ticked the next time you open the picker. The
 first time, nothing is ticked. `Select all` / `Select none` are there for long lists.
