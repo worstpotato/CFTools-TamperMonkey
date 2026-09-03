@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CFTools Tools: Helper Script
 // @namespace    austin.cftools.vpp
-// @version      5.18.0
+// @version      5.19.0
 // @description  Adds coordinate copy tools, Discord ban entry creation, profile trace comparison helpers, and server-log shortcuts for CFTools
 // @match        https://*cftools*/*
 // @match        https://*.cftools.cloud/*
@@ -2423,6 +2423,259 @@
     }
   }
 
+  // window.prompt only ever returns one line, so compare targets get their own small
+  // dialog. Shift+Enter opens another field, Enter starts the comparison, Escape
+  // closes it. Resolves with the normalized URLs, or null when it was cancelled.
+  //
+  // Validation happens in here rather than in the caller so a bad entry can be
+  // pointed at and fixed instead of throwing away everything else that was typed.
+  function promptForCompareUrls() {
+    const open = document.getElementById('trace-compare-dialog');
+    if (open) {
+      open.querySelector('input')?.focus();
+      return Promise.resolve(null);
+    }
+
+    return new Promise(resolve => {
+      const overlay = document.createElement('div');
+      overlay.id = 'trace-compare-dialog';
+      overlay.style.cssText = `
+        position: fixed; top: 0; right: 0; bottom: 0; left: 0;
+        background: rgba(0,0,0,.55); display: flex;
+        align-items: center; justify-content: center;
+        z-index: 2147483646; font: 13px system-ui,sans-serif;
+      `;
+
+      const panel = document.createElement('div');
+      panel.style.cssText = `
+        background: #16181d; color: #fff; border: 1px solid #333;
+        border-radius: 10px; box-shadow: 0 18px 50px rgba(0,0,0,.45);
+        padding: 18px; width: min(560px, calc(100vw - 40px));
+        max-height: calc(100vh - 80px); overflow: auto;
+      `;
+
+      const title = document.createElement('div');
+      title.textContent = 'Compare Traces';
+      title.style.cssText = 'font-size: 15px; font-weight: 600; margin-bottom: 4px;';
+
+      const hint = document.createElement('div');
+      hint.textContent = 'Paste a CFTools profile URL. Shift+Enter adds another field, Enter starts the comparison.';
+      hint.style.cssText = 'color: #9aa0a6; margin-bottom: 12px; line-height: 1.4;';
+
+      const rows = document.createElement('div');
+
+      const error = document.createElement('div');
+      error.style.cssText = 'color: #ff7676; margin-top: 10px; min-height: 16px;';
+
+      function close(result) {
+        document.removeEventListener('keydown', onDocumentKeydown, true);
+        overlay.remove();
+        resolve(result);
+      }
+
+      function onDocumentKeydown(event) {
+        if (event.key !== 'Escape') return;
+        event.preventDefault();
+        close(null);
+      }
+
+      function submit() {
+        const inputs = Array.from(rows.querySelectorAll('input'));
+        const urls = [];
+        const seen = new Set();
+        let firstInvalid = null;
+
+        for (const input of inputs) {
+          const raw = input.value.trim();
+          if (!raw) continue;
+
+          const normalized = normalizeCompareTargetUrl(raw);
+          if (!normalized) {
+            input.style.borderColor = '#ff7676';
+            if (!firstInvalid) firstInvalid = input;
+            continue;
+          }
+
+          // The same profile twice is one visit's worth of work for no extra answer.
+          if (seen.has(normalized)) continue;
+          seen.add(normalized);
+          urls.push(normalized);
+        }
+
+        if (firstInvalid) {
+          error.textContent = 'That is not a CFTools profile URL.';
+          firstInvalid.focus();
+          return;
+        }
+
+        if (!urls.length) {
+          error.textContent = 'Enter at least one CFTools profile URL.';
+          inputs[0]?.focus();
+          return;
+        }
+
+        close(urls);
+      }
+
+      function addRowAfter(row) {
+        const next = createRow();
+        row.insertAdjacentElement('afterend', next);
+        next.querySelector('input').focus();
+      }
+
+      function createRow() {
+        const row = document.createElement('div');
+        row.style.cssText = 'display: flex; gap: 6px; margin-bottom: 6px;';
+
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.placeholder = 'https://app.cftools.cloud/profile/...';
+        input.style.cssText = `
+          flex: 1; min-width: 0; background: #0f1114; color: #fff;
+          border: 1px solid #3a3f46; border-radius: 6px;
+          padding: 7px 9px; font: inherit;
+        `;
+        input.addEventListener('input', () => {
+          input.style.borderColor = '#3a3f46';
+          error.textContent = '';
+        });
+        input.addEventListener('keydown', event => {
+          if (event.key !== 'Enter') return;
+          event.preventDefault();
+
+          if (event.shiftKey) {
+            addRowAfter(row);
+            return;
+          }
+          submit();
+        });
+
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.textContent = '×';
+        remove.title = 'Remove this field';
+        remove.style.cssText = `
+          background: transparent; color: #9aa0a6; border: 1px solid #3a3f46;
+          border-radius: 6px; cursor: pointer; font: inherit; padding: 0 9px;
+        `;
+        remove.addEventListener('click', () => {
+          // The last field stays put: an empty dialog has nothing left to type into.
+          if (rows.children.length === 1) {
+            input.value = '';
+            input.style.borderColor = '#3a3f46';
+            input.focus();
+            return;
+          }
+
+          row.remove();
+          rows.querySelector('input')?.focus();
+        });
+
+        row.append(input, remove);
+        return row;
+      }
+
+      function createActionButton(label, background, hover) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = label;
+        button.style.cssText = `
+          background: ${background}; color: #fff; border: none; border-radius: 6px;
+          cursor: pointer; font: inherit; padding: 7px 12px; white-space: nowrap;
+        `;
+        button.addEventListener('mouseenter', () => (button.style.background = hover));
+        button.addEventListener('mouseleave', () => (button.style.background = background));
+        return button;
+      }
+
+      const addButton = createActionButton('Add another', '#2c313a', '#3a414c');
+      addButton.addEventListener('click', () => addRowAfter(rows.lastElementChild));
+
+      const spacer = document.createElement('div');
+      spacer.style.cssText = 'flex: 1;';
+
+      const cancelButton = createActionButton('Cancel', '#2c313a', '#3a414c');
+      cancelButton.addEventListener('click', () => close(null));
+
+      const compareButton = createActionButton('Compare', '#1f6f4a', '#27885b');
+      compareButton.addEventListener('click', () => submit());
+
+      const actions = document.createElement('div');
+      actions.style.cssText = 'display: flex; align-items: center; gap: 8px; margin-top: 12px;';
+      actions.append(addButton, spacer, cancelButton, compareButton);
+
+      rows.appendChild(createRow());
+      panel.append(title, hint, rows, error, actions);
+      overlay.appendChild(panel);
+      overlay.addEventListener('mousedown', event => {
+        if (event.target === overlay) close(null);
+      });
+
+      document.addEventListener('keydown', onDocumentKeydown, true);
+      document.body.appendChild(overlay);
+      rows.querySelector('input').focus();
+    });
+  }
+
+  // The multi-target version of buildTraceCompareReport. Unlike the alt report it
+  // keeps the targets that came back empty: these URLs were asked for by hand, so
+  // "nothing shared" is an answer the user wants to see rather than a row to hide.
+  function buildMultiCompareReport(sourceProfile, sourceSteam64, results) {
+    const sourceUrl = sourceProfile?.url || '';
+    const lines = [
+      'Source Account:',
+      sourceSteam64 ? `${sourceUrl} (${sourceSteam64})` : sourceUrl,
+      '',
+      `Compared Against ${results.length} Profile(s):`,
+    ];
+
+    results.forEach(result => {
+      const targetUrl = result.url || '';
+
+      lines.push('');
+      lines.push(result.steam64 ? `${targetUrl} (${result.steam64})` : targetUrl);
+      lines.push('Exact Traces:');
+      lines.push(...(result.sharedTraces.length ? result.sharedTraces : ['None found']));
+      lines.push('Similar Traces:');
+      lines.push(...(result.similarMatches.length ? result.similarMatches : ['None found']));
+      lines.push('Shared IPs:');
+      lines.push(...(result.sharedIps.length ? result.sharedIps : ['None found']));
+    });
+
+    return lines.join('\n');
+  }
+
+  // Both multi-target workflows end the same way, and the alt path reached that
+  // ending from two places with the block copied out twice. reportMode is what
+  // tells the two apart: the Compare Alts button leaves it unset, while Compare
+  // Traces sets it when it hands several URLs to the same stages.
+  async function finishMultiCompare(state, results) {
+    const isExplicitCompare = state.reportMode === 'compare';
+    const report = isExplicitCompare
+      ? buildMultiCompareReport(state.sourceProfile, state.sourceSteam64 || '', results)
+      : buildAltCompareReport(state.sourceProfile, state.sourceSteam64 || '', results);
+    const successToast = isExplicitCompare
+      ? 'Trace comparison copied to clipboard.'
+      : 'Alt comparison copied to clipboard.';
+    const failureToast = isExplicitCompare
+      ? 'Trace comparison ready. Copy failed.'
+      : 'Alt comparison ready. Copy failed.';
+    const returnUrl = state.sourceProfile?.url || '';
+
+    if (returnUrl && returnUrl !== location.href) {
+      saveReportState(state.sourceProfile, report, successToast, failureToast);
+      location.href = returnUrl;
+      return;
+    }
+
+    clearTraceCompareState();
+
+    const copied = await copyText(report);
+    console.log(report);
+    toast(copied ? successToast : failureToast);
+    window.alert(report);
+  }
+
   // Button shown on the Identities area for launching a trace compare job.
   function createTraceCompareButton() {
     const btn = document.createElement('button');
@@ -2444,23 +2697,34 @@
     btn.addEventListener('mouseenter', () => (btn.style.background = '#27885b'));
     btn.addEventListener('mouseleave', () => (btn.style.background = '#1f6f4a'));
     btn.addEventListener('click', async () => {
-      const targetUrlInput = (window.prompt('Paste the other profile URL:', '') || '').trim();
-      if (!targetUrlInput) return;
-
-      const targetUrl = normalizeCompareTargetUrl(targetUrlInput);
-      if (!targetUrl) {
-        toast('Please enter a valid CFTools profile URL.');
-        return;
-      }
+      const targetUrls = await promptForCompareUrls();
+      if (!targetUrls?.length) return;
 
       const sourceProfile = getCurrentProfileSummary();
-      saveTraceCompareState({
-        stage: 'collect-source',
-        sourceProfile,
-        targetUrl,
-      });
 
-      toast('Starting trace comparison...');
+      // A single target keeps the original two-profile workflow and the report
+      // shape that goes with it. Several reuse the multi-target stages the alt
+      // compare already runs on, marked so they report as a compare rather than
+      // as an alt hunt.
+      if (targetUrls.length === 1) {
+        saveTraceCompareState({
+          stage: 'collect-source',
+          sourceProfile,
+          targetUrl: targetUrls[0],
+        });
+        toast('Starting trace comparison...');
+      } else {
+        saveTraceCompareState({
+          stage: 'alt-collect-source',
+          sourceProfile,
+          reportMode: 'compare',
+          altUrls: targetUrls,
+          altResults: [],
+          currentAltIndex: 0,
+        });
+        toast(`Starting trace comparison on ${targetUrls.length} profiles...`);
+      }
+
       await resumeTraceCompareWorkflow();
     });
     return btn;
@@ -2715,6 +2979,7 @@
         saveTraceCompareState({
           stage: 'alt-collect-target',
           sourceProfile: state.sourceProfile,
+          reportMode: state.reportMode,
           sourceTraces: sourceData.traces,
           sourceIps: sourceData.ips,
           sourceSteam64: sourceData.steam64,
@@ -2730,7 +2995,7 @@
         }
 
         clearTraceCompareState();
-        toast('No Alt Accounts Found');
+        toast(state.reportMode === 'compare' ? 'No profiles to compare.' : 'No Alt Accounts Found');
         return;
       }
 
@@ -2739,29 +3004,7 @@
         const currentAltIndex = state.currentAltIndex || 0;
         const currentAltUrl = altUrls[currentAltIndex];
         if (!currentAltUrl) {
-          const report = buildAltCompareReport(
-            state.sourceProfile,
-            state.sourceSteam64 || '',
-            state.altResults || []
-          );
-          const returnUrl = state.sourceProfile?.url || '';
-
-          if (returnUrl && returnUrl !== location.href) {
-            saveReportState(
-              state.sourceProfile,
-              report,
-              'Alt comparison copied to clipboard.',
-              'Alt comparison ready. Copy failed.'
-            );
-            location.href = returnUrl;
-            return;
-          }
-
-          clearTraceCompareState();
-          const copied = await copyText(report);
-          console.log(report);
-          toast(copied ? 'Alt comparison copied to clipboard.' : 'Alt comparison ready. Copy failed.');
-          window.alert(report);
+          await finishMultiCompare(state, state.altResults || []);
           return;
         }
 
@@ -2771,7 +3014,12 @@
           return;
         }
 
-        const targetData = await collectProfileComparisonData(`alt account ${currentAltIndex + 1}`);
+        // The progress toasts say what the user actually asked for, so a compare
+        // does not narrate itself as an alt hunt.
+        const targetLabel = state.reportMode === 'compare'
+          ? `profile ${currentAltIndex + 1} of ${altUrls.length}`
+          : `alt account ${currentAltIndex + 1}`;
+        const targetData = await collectProfileComparisonData(targetLabel);
         const matches = buildSharedMatchData(
           state.sourceTraces || [],
           targetData.traces,
@@ -2794,6 +3042,7 @@
           saveTraceCompareState({
             stage: 'alt-collect-target',
             sourceProfile: state.sourceProfile,
+            reportMode: state.reportMode,
             sourceTraces: state.sourceTraces || [],
             sourceIps: state.sourceIps || [],
             sourceSteam64: state.sourceSteam64 || '',
@@ -2805,29 +3054,8 @@
           return;
         }
 
-        const report = buildAltCompareReport(
-          state.sourceProfile,
-          state.sourceSteam64 || '',
-          altResults
-        );
-        const returnUrl = state.sourceProfile?.url || '';
-
-        if (returnUrl && returnUrl !== location.href) {
-          saveReportState(
-            state.sourceProfile,
-            report,
-            'Alt comparison copied to clipboard.',
-            'Alt comparison ready. Copy failed.'
-          );
-          location.href = returnUrl;
-          return;
-        }
-
-        clearTraceCompareState();
-        const copied = await copyText(report);
-        console.log(report);
-        toast(copied ? 'Alt comparison copied to clipboard.' : 'Alt comparison ready. Copy failed.');
-        window.alert(report);
+        await finishMultiCompare(state, altResults);
+        return;
       }
 
       if (state.stage === 'show-report') {

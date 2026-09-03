@@ -96,11 +96,19 @@ On the profile `Identities` / `Traces` area, the script adds a `Compare Traces` 
 
 It will:
 
-1. Ask for another CFTools profile URL.
+1. Open a dialog asking for another CFTools profile URL.
 2. Collect traces from the current profile.
 3. Open the other profile.
 4. Collect its traces.
 5. Copy the shared traces to your clipboard.
+
+To compare against more than one profile, press `Shift+Enter` in the dialog (or click
+`Add another`) to add a field, and paste the next URL into it. `Enter` starts the
+comparison, `Escape` closes the dialog, and `x` next to a field removes it.
+
+With several URLs, the source profile is collected once and then compared against each
+target in turn. The report lists every profile you entered, including the ones that shared
+nothing.
 
 ### 4. Server Logs Shortcut
 
