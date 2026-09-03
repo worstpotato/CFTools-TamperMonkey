@@ -5,6 +5,7 @@ Tampermonkey userscript for CFTools that adds a few admin quality-of-life tools:
 - Copy DayZ admin coordinates in `X,Z,Y` format
 - Create a Discord ban entry template from a player profile
 - Compare trace names between two CFTools profiles
+- Jump from an activity row straight into the matching server logs
 
 ## Install Tampermonkey
 
@@ -85,6 +86,9 @@ It can fill:
 - Prompted reason
 - Prompted term
 
+To hide the button, click the Tampermonkey icon while on a CFTools page and choose
+`Hide Create Discord Ban Entry button`. The same entry brings it back.
+
 ### 3. Compare Traces
 
 On the profile `Identities` / `Traces` area, the script adds a `Compare Traces` button.
@@ -96,3 +100,48 @@ It will:
 3. Open the other profile.
 4. Collect its traces.
 5. Copy the shared traces to your clipboard.
+
+### 4. Server Logs Shortcut
+
+On profile activity rows for kill, damage, broken-leg and gas events, the script adds a
+`Server Logs` button.
+
+Clicking it opens that server's log page in a new tab and fills the filters in for you:
+
+- Start date: 30 minutes before the event
+- End date: 10 minutes after the event
+- Geo-Search: the event's map position
+
+The tab needs popups allowed for `app.cftools.cloud`. Server ids are read from CFTools'
+own server nav on the page, so nothing needs configuring: every server on your account
+works, and one added, renamed or removed in CFTools is picked up on the next page load.
+
+To hide the buttons, click the Tampermonkey icon while on a CFTools page and choose
+`Hide Server Logs buttons`. The same entry brings them back. Existing buttons disappear
+immediately, in every open CFTools tab.
+
+## Settings
+
+Settings are toggled from the Tampermonkey menu: open a CFTools page and click the
+Tampermonkey icon in the browser toolbar.
+
+| Menu entry | Default | What it does |
+| --- | --- | --- |
+| `Hide / Show Server Logs buttons` | Shown | Whether activity rows get a `Server Logs` button |
+| `Hide / Show Create Discord Ban Entry button` | Shown | Whether profiles get a `Create Discord Ban Entry` button |
+| `Enable / Disable debug logging` | Off | Verbose `[CFTools Tools]` console output, see Troubleshooting |
+
+All three apply to any other CFTools tabs you have open without reloading them. They are
+stored in the script's own Tampermonkey storage as `codex-server-logs-buttons`,
+`codex-ban-entry-button` and `codex-debug-mode`, and can also be edited from the
+Tampermonkey dashboard: open the script and select the `Storage` tab (set `Config mode`
+to `Advanced` if you do not see it).
+
+## Troubleshooting
+
+CFTools changes its markup from time to time, which is usually why a button stops
+appearing. The script has a debug mode that logs what it did and did not find.
+
+Turn on `Enable debug logging` from the Tampermonkey menu (see Settings above), then
+open devtools and look for `[CFTools Tools]` lines in the console. They report what the
+script found and did not find on the page.
