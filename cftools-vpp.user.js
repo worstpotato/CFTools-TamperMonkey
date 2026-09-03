@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CFTools Tools: Helper Script
 // @namespace    austin.cftools.vpp
-// @version      5.14.0
+// @version      5.18.0
 // @description  Adds coordinate copy tools, Discord ban entry creation, profile trace comparison helpers, and server-log shortcuts for CFTools
 // @match        https://*cftools*/*
 // @match        https://*.cftools.cloud/*
@@ -27,6 +27,7 @@
   // and are also editable from the Storage tab in the dashboard.
   const SERVER_LOGS_BUTTONS_STORAGE_KEY = 'codex-server-logs-buttons';
   const BAN_ENTRY_BUTTON_STORAGE_KEY = 'codex-ban-entry-button';
+  const CHEATER_SCAN_BUTTON_STORAGE_KEY = 'codex-cheater-scan-button';
   const DEBUG_MODE_STORAGE_KEY = 'codex-debug-mode';
 
   /*************** Toast ***************/
@@ -186,6 +187,20 @@
 
   function isBanEntryButtonEnabled() {
     return banEntryButtonToggle.isEnabled();
+  }
+
+  // Dashboard-side helper. Same deal again: the refresh puts the button on the
+  // player list or takes it away immediately.
+  const cheaterScanButtonToggle = createMenuToggle({
+    storageKey: CHEATER_SCAN_BUTTON_STORAGE_KEY,
+    defaultValue: true,
+    captionFor: enabled => `${enabled ? 'Hide' : 'Show'} Scan Bans button`,
+    toastFor: enabled => (enabled ? 'Scan Bans button shown.' : 'Scan Bans button hidden.'),
+    onChange: () => scheduleProfileRefresh(),
+  });
+
+  function isCheaterScanButtonEnabled() {
+    return cheaterScanButtonToggle.isEnabled();
   }
 
   // Verbose console logging for when CFTools changes its markup and a button
@@ -502,6 +517,13 @@
   // .textContent, so this would silently return ''.
   function getCleanText(node) {
     return cleanWhitespace(node?.textContent);
+  }
+
+  // The text that belongs to this element itself, with anything nested inside it
+  // left out. Used where a label shares its element with a badge or an icon:
+  // "Bans 2 public ban(s)" has to read back as just "Bans".
+  function getOwnText(node) {
+    return node ? cleanWhitespace(getBoldDirectText(node)) : '';
   }
 
   /*************** Server logs helper ***************/
@@ -2856,6 +2878,478 @@
     }
   }
 
+  /*************** Cheater ban scan ***************/
+  // Walks the dashboard's player list, opens every player wearing a public-ban
+  // badge, and reports back the ones whose ban reasons name them a cheater.
+  //
+  // Like the trace compare, this drives the page rather than calling an API: the
+  // bans only exist in the DOM once a profile's Bans tab has rendered, so the job
+  // navigates the tab and picks itself back up out of sessionStorage after every
+  // load.
+  const CHEATER_SCAN_KEY = 'codex-cheater-scan-state';
+  // Refreshed on every hop, so this is the budget for one profile rather than for
+  // the whole scan, which can legitimately take a while on a full server.
+  const CHEATER_SCAN_RESUME_TTL_MS = 10 * 60 * 1000;
+  // Case-insensitive substring match against the ban reason. "cheat" and
+  // "cheating" are deliberately left out: the reason has to actually say cheater.
+  // Add entries here to widen it.
+  const CHEATER_BAN_KEYWORDS = ['cheater'];
+  // Checked first and wins outright: a ban handed out for associating with a
+  // cheater still says "cheater" in its reason, but it is not a cheater ban.
+  const CHEATER_BAN_EXCLUSIONS = ['association'];
+  // The dashboard renders this badge as "2 public bans"; the profile sidebar uses
+  // "2 public ban(s)". Matching the singular covers both.
+  const PUBLIC_BAN_BADGE_RE = /public ban/i;
+  let cheaterScanRunning = false;
+
+  function loadCheaterScanState() {
+    try {
+      return JSON.parse(sessionStorage.getItem(CHEATER_SCAN_KEY) || 'null');
+    } catch {
+      return null;
+    }
+  }
+
+  // Timestamped on every save so an abandoned scan expires instead of waking up
+  // much later, and so a storage failure is reported rather than escaping out of a
+  // click handler unexplained.
+  function saveCheaterScanState(state) {
+    try {
+      sessionStorage.setItem(CHEATER_SCAN_KEY, JSON.stringify({
+        createdAt: Date.now(),
+        ...state,
+      }));
+      return true;
+    } catch (err) {
+      console.error('Could not save cheater scan state:', err);
+      toast('Could not save scan progress.');
+      return false;
+    }
+  }
+
+  function clearCheaterScanState() {
+    try {
+      sessionStorage.removeItem(CHEATER_SCAN_KEY);
+    } catch (err) {
+      console.error('Could not clear cheater scan state:', err);
+    }
+  }
+
+  function isCheaterScanStateExpired(state) {
+    if (!state?.createdAt) return true;
+    return (Date.now() - state.createdAt) > CHEATER_SCAN_RESUME_TTL_MS;
+  }
+
+  // Query strings and hashes are ignored when checking whether the return trip has
+  // landed: the dashboard route can pick one up on its own, and it is still the
+  // same page.
+  function isSameLocation(a, b) {
+    try {
+      const left = new URL(a || '', location.origin);
+      const right = new URL(b || '', location.origin);
+      return left.origin === right.origin && left.pathname === right.pathname;
+    } catch {
+      return false;
+    }
+  }
+
+  function getDashboardPlayerCards() {
+    return Array.from(document.querySelectorAll('.c-players-col .c-player'));
+  }
+
+  // The visible label of a `.text-copyable` lives in its first text node; the rest
+  // of the span is the offscreen textarea CFTools uses for its own copy button.
+  function getCopyableText(node) {
+    if (!node) return '';
+
+    for (const child of node.childNodes) {
+      if (child.nodeType !== Node.TEXT_NODE) continue;
+      const text = cleanWhitespace(child.textContent);
+      if (text) return text;
+    }
+
+    return getCleanText(node);
+  }
+
+  function getDashboardPlayerName(card) {
+    return getCopyableText(card.querySelector('.c-player-names .c-truncate-text .text-copyable'));
+  }
+
+  // Player rows carry several badge slots (VPN, VAC, public bans). Only a public
+  // ban has a CFTools ban list behind it with a reason to read; a VAC ban is
+  // Steam-side and carries no text to match on.
+  function getPublicBanBadge(card) {
+    for (const badge of card.querySelectorAll('.c-player-badge .badge')) {
+      if (PUBLIC_BAN_BADGE_RE.test(getCleanText(badge))) return badge;
+    }
+    return null;
+  }
+
+  // Every card keeps its "Open profile" link in the collapsed body, so the rows do
+  // not have to be expanded first.
+  function getDashboardPlayerProfileUrl(card) {
+    const href = card.querySelector('a[href*="/profile/"]')?.getAttribute('href');
+    if (!href) return '';
+
+    try {
+      return new URL(href, location.origin).href;
+    } catch {
+      return '';
+    }
+  }
+
+  // Deduplicated by CFTools id: a player who reconnects during the scan can show up
+  // in the list twice, and visiting the same profile twice only pads the report.
+  function getBannedDashboardPlayers() {
+    const players = [];
+    const seen = new Set();
+
+    for (const card of getDashboardPlayerCards()) {
+      const badge = getPublicBanBadge(card);
+      if (!badge) continue;
+
+      const url = getDashboardPlayerProfileUrl(card);
+      const cfid = getCfIdFromUrl(url);
+      if (!url || !cfid || seen.has(cfid)) continue;
+
+      seen.add(cfid);
+      players.push({
+        cfid,
+        url,
+        name: getDashboardPlayerName(card) || cfid,
+        badge: getCleanText(badge),
+      });
+    }
+
+    return players;
+  }
+
+  // The sidebar's Bans entry carries a count badge ("Bans 2 public ban(s)"), so the
+  // exact-text match findProfileLink uses cannot find it.
+  function findBansProfileLink() {
+    for (const link of document.querySelectorAll('.profile-links .profile-link')) {
+      if (link.classList.contains('profile-server-link')) continue;
+      if (/^bans$/i.test(getOwnText(link))) return link;
+    }
+    return null;
+  }
+
+  // The Bans view renders a plain bootstrap-vue table. Matching on its header text
+  // rather than on an id keeps this working when CFTools renumbers its __BVID__s.
+  function findBanTable() {
+    for (const table of document.querySelectorAll('table')) {
+      const headers = Array.from(table.querySelectorAll('thead th'))
+        .map(th => getCleanText(th).toLowerCase());
+      if (headers.includes('ban list') && headers.includes('reason')) return table;
+    }
+    return null;
+  }
+
+  // Column positions are read off the header row instead of being hard-coded, so an
+  // added or reordered column cannot shift the reason out from under us. Expires is
+  // read past rather than recorded: the report does not quote it.
+  function getBanTableColumnIndexes(table) {
+    const indexes = {};
+
+    Array.from(table.querySelectorAll('thead th')).forEach((th, index) => {
+      const label = getCleanText(th).toLowerCase();
+      if (label && !(label in indexes)) indexes[label] = index;
+    });
+
+    return indexes;
+  }
+
+  // The ban list cell also holds the game-mode badge and a hidden preview card, so
+  // only the cell's own text is the list's name.
+  function getBanListName(cell) {
+    const header = cell?.querySelector('.c-banlist-header');
+    if (!header) return getCleanText(cell);
+    return getOwnText(header) || getCleanText(header);
+  }
+
+  function readBansFromPage() {
+    const table = findBanTable();
+    if (!table) return [];
+
+    const indexes = getBanTableColumnIndexes(table);
+    const bans = [];
+
+    for (const row of table.querySelectorAll('tbody tr')) {
+      const cells = Array.from(row.querySelectorAll('td'));
+      if (!cells.length) continue;
+
+      const cellText = label => {
+        const index = indexes[label];
+        return index === undefined ? '' : getCleanText(cells[index]);
+      };
+
+      bans.push({
+        banList: getBanListName(cells[indexes['ban list']]),
+        issued: cellText('issue date'),
+        reason: cellText('reason'),
+      });
+    }
+
+    return bans;
+  }
+
+  function isCheaterBan(ban) {
+    const reason = (ban?.reason || '').toLowerCase();
+    if (!reason) return false;
+    if (CHEATER_BAN_EXCLUSIONS.some(keyword => reason.includes(keyword))) return false;
+    return CHEATER_BAN_KEYWORDS.some(keyword => reason.includes(keyword));
+  }
+
+  // Opens the profile's Bans tab and reads the table out of it.
+  async function collectProfileBans(label) {
+    toast(`Checking ${label}...`, 2500);
+    await waitForPageReady();
+
+    const bansLink = await waitForElement(() => findBansProfileLink(), 15000);
+    if (!bansLink.classList.contains('profile-link-active')) {
+      clickElement(bansLink);
+      await waitForElement(
+        () => findBansProfileLink()?.classList.contains('profile-link-active') || null,
+        10000
+      );
+    }
+
+    // A missing table is a result, not a failure: the badge counts can lag, and a
+    // profile can end up on the Bans tab with nothing to show. The shorter wait
+    // keeps that case from costing the full element timeout on every player.
+    try {
+      await waitForElement(() => findBanTable(), 8000);
+    } catch {
+      debugLog('[CFTools Tools] Cheater scan: no ban table rendered for', label);
+      return [];
+    }
+
+    return readBansFromPage();
+  }
+
+  function buildCheaterScanReport(state) {
+    const results = state.results || [];
+    const flagged = results.filter(result => result.matches?.length);
+    const keywords = CHEATER_BAN_KEYWORDS.join(' / ');
+
+    const lines = [
+      'Cheater Ban Scan',
+      `Players with a ${keywords} ban: ${flagged.length}`,
+      '',
+      'Flagged Players:',
+    ];
+
+    if (!flagged.length) {
+      lines.push('None found');
+    } else {
+      flagged.forEach((result, index) => {
+        if (index > 0) lines.push('');
+        lines.push(`${result.name} - ${result.url}`);
+
+        result.matches.forEach(ban => {
+          const suffix = ban.issued ? ` (issued ${ban.issued})` : '';
+          lines.push(`- [${ban.banList || 'Unknown ban list'}] ${ban.reason || 'No reason given'}${suffix}`);
+        });
+      });
+    }
+
+    return lines.join('\n');
+  }
+
+  async function showCheaterScanReport(report) {
+    const copied = await copyText(report);
+    console.log(report);
+    toast(copied ? 'Cheater scan copied to clipboard.' : 'Cheater scan ready. Copy failed.');
+    window.alert(report);
+  }
+
+  // The dashboard is a different page by the time the queue runs dry, so the report
+  // rides along in the saved state and is shown once the return trip lands.
+  async function finishCheaterScan(state) {
+    const report = buildCheaterScanReport(state);
+
+    if (state.returnUrl && !isSameLocation(state.returnUrl, location.href)) {
+      if (saveCheaterScanState({ stage: 'show-report', returnUrl: state.returnUrl, report })) {
+        location.href = state.returnUrl;
+        return;
+      }
+    }
+
+    clearCheaterScanState();
+    await showCheaterScanReport(report);
+  }
+
+  // Three-stage workflow:
+  // 1. Queue up every dashboard player carrying a public ban.
+  // 2. Visit each of their profiles in turn, reading the Bans tab on each.
+  // 3. Navigate back to the dashboard and show the report there.
+  async function resumeCheaterScanWorkflow() {
+    if (cheaterScanRunning) return;
+
+    const state = loadCheaterScanState();
+    if (!state) return;
+    if (isCheaterScanStateExpired(state)) {
+      clearCheaterScanState();
+      return;
+    }
+
+    cheaterScanRunning = true;
+
+    try {
+      if (state.stage === 'collect') {
+        const queue = state.queue || [];
+        const index = state.index || 0;
+        const player = queue[index];
+
+        if (!player) {
+          await finishCheaterScan(state);
+          return;
+        }
+
+        // Resumed somewhere other than the profile we were sent to, most likely
+        // because the user navigated away mid-scan. Leave the state alone so the
+        // job picks up again if they come back, and let the TTL clear it if not.
+        const currentCfid = getCfId();
+        if (!currentCfid || currentCfid !== player.cfid) return;
+
+        const results = [...(state.results || [])];
+
+        // A profile that will not load is one skipped player, not a dead scan, so the
+        // failure goes to the console and the queue moves on.
+        try {
+          const bans = await collectProfileBans(`${player.name} (${index + 1}/${queue.length})`);
+          results.push({
+            name: player.name,
+            url: player.url,
+            matches: bans.filter(isCheaterBan),
+          });
+        } catch (err) {
+          console.error(`Cheater scan could not read ${player.url}:`, err);
+        }
+
+        const nextState = { ...state, stage: 'collect', index: index + 1, results };
+        const nextPlayer = queue[index + 1];
+
+        if (!nextPlayer) {
+          await finishCheaterScan(nextState);
+          return;
+        }
+
+        if (!saveCheaterScanState(nextState)) {
+          clearCheaterScanState();
+          return;
+        }
+
+        location.href = nextPlayer.url;
+        return;
+      }
+
+      if (state.stage === 'show-report') {
+        // Still on the way back to the dashboard.
+        if (state.returnUrl && !isSameLocation(state.returnUrl, location.href)) return;
+
+        const report = state.report || 'No players scanned.';
+        clearCheaterScanState();
+        await showCheaterScanReport(report);
+      }
+    } catch (err) {
+      console.error('Cheater scan failed:', err);
+      clearCheaterScanState();
+      toast('Cheater scan failed. Check console for details.');
+    } finally {
+      cheaterScanRunning = false;
+    }
+  }
+
+  async function startCheaterScan() {
+    // An expired leftover is not a running scan: it would otherwise block every
+    // later scan until a refresh happened to clear it.
+    const pending = loadCheaterScanState();
+    if (cheaterScanRunning || (pending && !isCheaterScanStateExpired(pending))) {
+      toast('A cheater scan is already running.');
+      return;
+    }
+
+    const players = getBannedDashboardPlayers();
+    if (!players.length) {
+      toast('No players with public bans in this list.');
+      return;
+    }
+
+    const saved = saveCheaterScanState({
+      stage: 'collect',
+      returnUrl: location.href,
+      queue: players,
+      index: 0,
+      results: [],
+    });
+    if (!saved) return;
+
+    toast(`Starting cheater scan on ${players.length} player(s)...`);
+    location.href = players[0].url;
+  }
+
+  // Button shown on the dashboard's player-list toolbar, attached to the right-hand
+  // edge of the Search field the way the Sort group's own button is.
+  function createCheaterScanButton() {
+    const btn = document.createElement('button');
+    btn.id = 'cheater-scan-btn';
+    btn.type = 'button';
+    btn.className = 'btn btn-outline-danger btn-sm';
+    btn.textContent = 'Scan Bans';
+    btn.title = 'Open every player carrying a public ban and report the ones banned as a cheater';
+    btn.addEventListener('click', () => {
+      startCheaterScan().catch(err => {
+        console.error('Cheater scan failed to start:', err);
+        toast('Cheater scan failed to start. Check console for details.');
+      });
+    });
+    return btn;
+  }
+
+  // Anchored to the Search label rather than to a column position, because the
+  // toolbar's grid classes are shared with every other input group on the page.
+  function findDashboardSearchInputGroup() {
+    for (const label of document.querySelectorAll('.c-players-col .input-group .input-group-text')) {
+      if (getCleanText(label).toLowerCase() !== 'search') continue;
+
+      const group = label.closest('.input-group');
+      if (group) return group;
+    }
+    return null;
+  }
+
+  function removeCheaterScanButton() {
+    document.getElementById('cheater-scan-slot')?.remove();
+  }
+
+  function ensureCheaterScanButton() {
+    if (!isCheaterScanButtonEnabled()) {
+      removeCheaterScanButton();
+      return;
+    }
+
+    const group = findDashboardSearchInputGroup();
+    if (!group) {
+      removeCheaterScanButton();
+      return;
+    }
+
+    const existing = document.getElementById('cheater-scan-slot');
+    // The append has to stay last inside the group, or bootstrap rounds the wrong
+    // edge. A Vue rerender of the search field can drop it back in the middle.
+    if (existing && existing.parentElement === group && existing === group.lastElementChild) return;
+
+    const slot = existing || document.createElement('div');
+    if (!existing) {
+      slot.id = 'cheater-scan-slot';
+      slot.className = 'input-group-append';
+      slot.appendChild(createCheaterScanButton());
+    }
+
+    group.appendChild(slot);
+  }
+
   // Button shown in the profile header that prepares a Discord ban-entry template.
   function createBanEntryButton() {
     const btn = document.createElement('button');
@@ -2989,8 +3483,12 @@
     ensureBanEntryButton();
     ensureTraceCompareButton();
     ensureAltCompareButton();
+    ensureCheaterScanButton();
     resumeTraceCompareWorkflow().catch(err => {
       console.error('Trace comparison failed:', err);
+    });
+    resumeCheaterScanWorkflow().catch(err => {
+      console.error('Cheater scan failed:', err);
     });
   });
   const scheduleServerLogsRefresh = makeScheduler(() => {
@@ -3013,17 +3511,19 @@
 
   // CFTools sometimes renders a route in multiple passes.
   // These follow-up refreshes give profile helpers another chance to attach
-  // after the header/sidebar finishes painting.
+  // after the header/sidebar finishes painting. The dashboard needs them too now
+  // that the Scan Bans button and the scan report both land on the player list,
+  // so the guard only skips the one route with no profile-side helper on it.
   const PROFILE_REFRESH_RETRY_DELAYS_MS = [250, 1000, 2500, 5000, 10000, 15000];
   let profileRefreshRetryToken = 0;
 
   function queueProfileRefreshFollowUps() {
-    if (!isProfilePage()) return;
+    if (isServerLogsPage()) return;
 
     const retryToken = ++profileRefreshRetryToken;
     for (const delayMs of PROFILE_REFRESH_RETRY_DELAYS_MS) {
       window.setTimeout(() => {
-        if (profileRefreshRetryToken !== retryToken || !isProfilePage()) return;
+        if (profileRefreshRetryToken !== retryToken || isServerLogsPage()) return;
         scheduleProfileRefresh();
       }, delayMs);
     }

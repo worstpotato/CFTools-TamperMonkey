@@ -6,6 +6,7 @@ Tampermonkey userscript for CFTools that adds a few admin quality-of-life tools:
 - Create a Discord ban entry template from a player profile
 - Compare trace names between two CFTools profiles
 - Jump from an activity row straight into the matching server logs
+- Scan a server dashboard for players banned as cheaters
 
 ## Install Tampermonkey
 
@@ -120,6 +121,35 @@ To hide the buttons, click the Tampermonkey icon while on a CFTools page and cho
 `Hide Server Logs buttons`. The same entry brings them back. Existing buttons disappear
 immediately, in every open CFTools tab.
 
+### 5. Scan Bans
+
+On a server dashboard, the script adds a `Scan Bans` button to the right-hand edge of the
+player list's `Search` box.
+
+Clicking it will:
+
+1. Collect every player in the list carrying a `public bans` badge.
+2. Open each of those profiles in this tab and read their `Bans` tab.
+3. Return to the dashboard and copy a report to your clipboard.
+
+The report leads with how many players came back with a cheater ban, then lists them with
+the ban list, reason and issue date for each match. A profile the scan could not read is
+skipped and logged to the console.
+
+A reason mentioning `association` never counts, even when it also says `cheater`: being
+banned for associating with one is not the same as being banned as one.
+
+The scan drives this tab, so leave it alone while it runs. Progress is shown as a toast per
+player, and it keeps its place across the page loads. If you navigate away mid-scan it
+pauses, resumes if you return to the profile it was on, and gives up after 10 minutes on
+one player.
+
+Only `public bans` are followed up. A `VAC ban(s)` badge is Steam-side and carries no
+reason text to match against.
+
+To hide the button, click the Tampermonkey icon while on a CFTools page and choose
+`Hide Scan Bans button`. The same entry brings it back.
+
 ## Settings
 
 Settings are toggled from the Tampermonkey menu: open a CFTools page and click the
@@ -129,11 +159,12 @@ Tampermonkey icon in the browser toolbar.
 | --- | --- | --- |
 | `Hide / Show Server Logs buttons` | Shown | Whether activity rows get a `Server Logs` button |
 | `Hide / Show Create Discord Ban Entry button` | Shown | Whether profiles get a `Create Discord Ban Entry` button |
+| `Hide / Show Scan Bans button` | Shown | Whether the dashboard player list gets a `Scan Bans` button |
 | `Enable / Disable debug logging` | Off | Verbose `[CFTools Tools]` console output, see Troubleshooting |
 
-All three apply to any other CFTools tabs you have open without reloading them. They are
+All four apply to any other CFTools tabs you have open without reloading them. They are
 stored in the script's own Tampermonkey storage as `codex-server-logs-buttons`,
-`codex-ban-entry-button` and `codex-debug-mode`, and can also be edited from the
+`codex-ban-entry-button`, `codex-cheater-scan-button` and `codex-debug-mode`, and can also be edited from the
 Tampermonkey dashboard: open the script and select the `Storage` tab (set `Config mode`
 to `Advanced` if you do not see it).
 
