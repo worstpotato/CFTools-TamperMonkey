@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CFTools Tools: Helper Script
 // @namespace    austin.cftools.vpp
-// @version      5.14.0
+// @version      5.25.0
 // @description  Adds coordinate copy tools, Discord ban entry creation, profile trace comparison helpers, and server-log shortcuts for CFTools
 // @match        https://*cftools*/*
 // @match        https://*.cftools.cloud/*
@@ -27,6 +27,9 @@
   // and are also editable from the Storage tab in the dashboard.
   const SERVER_LOGS_BUTTONS_STORAGE_KEY = 'codex-server-logs-buttons';
   const BAN_ENTRY_BUTTON_STORAGE_KEY = 'codex-ban-entry-button';
+  const CHEATER_SCAN_BUTTON_STORAGE_KEY = 'codex-cheater-scan-button';
+  // Not a toggle: the server picker's last selection, as a JSON list of ids.
+  const CHEATER_SCAN_SERVERS_STORAGE_KEY = 'codex-cheater-scan-servers';
   const DEBUG_MODE_STORAGE_KEY = 'codex-debug-mode';
 
   /*************** Toast ***************/
@@ -186,6 +189,20 @@
 
   function isBanEntryButtonEnabled() {
     return banEntryButtonToggle.isEnabled();
+  }
+
+  // Dashboard-side helper. Same deal again: the refresh puts the button on the
+  // player list or takes it away immediately.
+  const cheaterScanButtonToggle = createMenuToggle({
+    storageKey: CHEATER_SCAN_BUTTON_STORAGE_KEY,
+    defaultValue: true,
+    captionFor: enabled => `${enabled ? 'Hide' : 'Show'} Scan Bans buttons`,
+    toastFor: enabled => (enabled ? 'Scan Bans buttons shown.' : 'Scan Bans buttons hidden.'),
+    onChange: () => scheduleProfileRefresh(),
+  });
+
+  function isCheaterScanButtonEnabled() {
+    return cheaterScanButtonToggle.isEnabled();
   }
 
   // Verbose console logging for when CFTools changes its markup and a button
@@ -502,6 +519,13 @@
   // .textContent, so this would silently return ''.
   function getCleanText(node) {
     return cleanWhitespace(node?.textContent);
+  }
+
+  // The text that belongs to this element itself, with anything nested inside it
+  // left out. Used where a label shares its element with a badge or an icon:
+  // "Bans 2 public ban(s)" has to read back as just "Bans".
+  function getOwnText(node) {
+    return node ? cleanWhitespace(getBoldDirectText(node)) : '';
   }
 
   /*************** Server logs helper ***************/
@@ -1559,12 +1583,12 @@
   }
 
   // Polls until a piece of UI exists. Useful because CFTools renders a lot of views asynchronously.
-  async function waitForElement(getter, timeoutMs = 10000) {
+  async function waitForElement(getter, timeoutMs = 10000, pollMs = 200) {
     const started = Date.now();
     while (Date.now() - started < timeoutMs) {
       const result = getter();
       if (result) return result;
-      await delay(200);
+      await delay(pollMs);
     }
     throw new Error('Timed out waiting for page content.');
   }
@@ -2401,6 +2425,379 @@
     }
   }
 
+  // Shared chrome for the script's dialogs. The two of them are built separately
+  // because their bodies have nothing in common, but they are meant to look like
+  // one thing, so the styling lives in one place.
+  const DIALOG_OVERLAY_CSS = `
+    position: fixed; top: 0; right: 0; bottom: 0; left: 0;
+    background: rgba(0,0,0,.55); display: flex;
+    align-items: center; justify-content: center;
+    z-index: 2147483646; font: 13px system-ui,sans-serif;
+  `;
+  const DIALOG_PANEL_CSS = `
+    background: #16181d; color: #fff; border: 1px solid #333;
+    border-radius: 10px; box-shadow: 0 18px 50px rgba(0,0,0,.45);
+    padding: 18px; width: min(560px, calc(100vw - 40px));
+    max-height: calc(100vh - 80px); overflow: auto;
+  `;
+  const DIALOG_TITLE_CSS = 'font-size: 15px; font-weight: 600; margin-bottom: 4px;';
+  const DIALOG_HINT_CSS = 'color: #9aa0a6; margin-bottom: 12px; line-height: 1.4;';
+  const DIALOG_ERROR_CSS = 'color: #ff7676; margin-top: 10px; min-height: 16px;';
+  const DIALOG_ACTIONS_CSS = 'display: flex; align-items: center; gap: 8px; margin-top: 12px;';
+  const DIALOG_NEUTRAL_BG = '#2c313a';
+  const DIALOG_NEUTRAL_HOVER = '#3a414c';
+  const DIALOG_CONFIRM_BG = '#1f6f4a';
+  const DIALOG_CONFIRM_HOVER = '#27885b';
+
+  function createDialogButton(label, background, hover) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = label;
+    button.style.cssText = `
+      background: ${background}; color: #fff; border: none; border-radius: 6px;
+      cursor: pointer; font: inherit; padding: 7px 12px; white-space: nowrap;
+    `;
+    button.addEventListener('mouseenter', () => (button.style.background = hover));
+    button.addEventListener('mouseleave', () => (button.style.background = background));
+    return button;
+  }
+
+  // Reports are mostly profile URLs, and window.alert renders them as dead text
+  // that cannot even be selected in some browsers. This is the same chrome as the
+  // dialogs above, with the links live and the body still copyable.
+  //
+  // It does not block the way alert does. Nothing runs after these calls, and the
+  // saved state is already cleared by the time one is shown.
+  const REPORT_URL_RE = /https?:\/\/[^\s)]+/g;
+
+  // Built out of text nodes rather than markup: a report carries player names taken
+  // off the page, and those are not ours to trust as HTML.
+  function appendLinkifiedText(container, text) {
+    let lastIndex = 0;
+    let match;
+
+    REPORT_URL_RE.lastIndex = 0;
+    while ((match = REPORT_URL_RE.exec(text)) !== null) {
+      if (match.index > lastIndex) {
+        container.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));
+      }
+
+      // Trailing sentence punctuation is not part of the URL.
+      const href = match[0].replace(/[.,;]+$/, '');
+      const link = document.createElement('a');
+      link.href = href;
+      link.textContent = href;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.style.cssText = 'color: #6fb1ff; text-decoration: underline;';
+      container.appendChild(link);
+
+      if (href.length < match[0].length) {
+        container.appendChild(document.createTextNode(match[0].slice(href.length)));
+      }
+      lastIndex = REPORT_URL_RE.lastIndex;
+    }
+
+    if (lastIndex < text.length) {
+      container.appendChild(document.createTextNode(text.slice(lastIndex)));
+    }
+  }
+
+  function showReportModal(report, title = 'Report') {
+    // A second report replaces the first rather than stacking on top of it.
+    document.getElementById('codex-report-modal')?.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'codex-report-modal';
+    overlay.style.cssText = DIALOG_OVERLAY_CSS;
+
+    const panel = document.createElement('div');
+    panel.style.cssText = `
+      ${DIALOG_PANEL_CSS}
+      width: min(760px, calc(100vw - 40px));
+    `;
+
+    const heading = document.createElement('div');
+    heading.textContent = title;
+    heading.style.cssText = DIALOG_TITLE_CSS;
+
+    const body = document.createElement('div');
+    body.style.cssText = `
+      white-space: pre-wrap; word-break: break-word; margin-top: 8px;
+      max-height: 60vh; overflow: auto; background: #0f1114;
+      border: 1px solid #2c313a; border-radius: 6px; padding: 10px 12px;
+      font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    `;
+    appendLinkifiedText(body, report);
+
+    function close() {
+      document.removeEventListener('keydown', onDocumentKeydown, true);
+      overlay.remove();
+    }
+
+    function onDocumentKeydown(event) {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      close();
+    }
+
+    const copyButton = createDialogButton('Copy', DIALOG_NEUTRAL_BG, DIALOG_NEUTRAL_HOVER);
+    copyButton.addEventListener('click', async () => {
+      const copied = await copyText(report);
+      toast(copied ? 'Report copied to clipboard.' : 'Could not copy the report.');
+    });
+
+    const spacer = document.createElement('div');
+    spacer.style.cssText = 'flex: 1;';
+
+    const closeButton = createDialogButton('Close', DIALOG_CONFIRM_BG, DIALOG_CONFIRM_HOVER);
+    closeButton.addEventListener('click', () => close());
+
+    const actions = document.createElement('div');
+    actions.style.cssText = DIALOG_ACTIONS_CSS;
+    actions.append(copyButton, spacer, closeButton);
+
+    panel.append(heading, body, actions);
+    overlay.appendChild(panel);
+    overlay.addEventListener('mousedown', event => {
+      if (event.target === overlay) close();
+    });
+
+    document.addEventListener('keydown', onDocumentKeydown, true);
+    document.body.appendChild(overlay);
+    closeButton.focus();
+  }
+
+  // window.prompt only ever returns one line, so compare targets get their own small
+  // dialog. Shift+Enter opens another field, Enter starts the comparison, Escape
+  // closes it. Resolves with the normalized URLs, or null when it was cancelled.
+  //
+  // Validation happens in here rather than in the caller so a bad entry can be
+  // pointed at and fixed instead of throwing away everything else that was typed.
+  function promptForCompareUrls() {
+    const open = document.getElementById('trace-compare-dialog');
+    if (open) {
+      open.querySelector('input')?.focus();
+      return Promise.resolve(null);
+    }
+
+    return new Promise(resolve => {
+      const overlay = document.createElement('div');
+      overlay.id = 'trace-compare-dialog';
+      overlay.style.cssText = DIALOG_OVERLAY_CSS;
+
+      const panel = document.createElement('div');
+      panel.style.cssText = DIALOG_PANEL_CSS;
+
+      const title = document.createElement('div');
+      title.textContent = 'Compare Traces';
+      title.style.cssText = DIALOG_TITLE_CSS;
+
+      const hint = document.createElement('div');
+      hint.textContent = 'Paste a CFTools profile URL. Shift+Enter adds another field, Enter starts the comparison.';
+      hint.style.cssText = DIALOG_HINT_CSS;
+
+      const rows = document.createElement('div');
+
+      const error = document.createElement('div');
+      error.style.cssText = DIALOG_ERROR_CSS;
+
+      function close(result) {
+        document.removeEventListener('keydown', onDocumentKeydown, true);
+        overlay.remove();
+        resolve(result);
+      }
+
+      function onDocumentKeydown(event) {
+        if (event.key !== 'Escape') return;
+        event.preventDefault();
+        close(null);
+      }
+
+      function submit() {
+        const inputs = Array.from(rows.querySelectorAll('input'));
+        const urls = [];
+        const seen = new Set();
+        let firstInvalid = null;
+
+        for (const input of inputs) {
+          const raw = input.value.trim();
+          if (!raw) continue;
+
+          const normalized = normalizeCompareTargetUrl(raw);
+          if (!normalized) {
+            input.style.borderColor = '#ff7676';
+            if (!firstInvalid) firstInvalid = input;
+            continue;
+          }
+
+          // The same profile twice is one visit's worth of work for no extra answer.
+          if (seen.has(normalized)) continue;
+          seen.add(normalized);
+          urls.push(normalized);
+        }
+
+        if (firstInvalid) {
+          error.textContent = 'That is not a CFTools profile URL.';
+          firstInvalid.focus();
+          return;
+        }
+
+        if (!urls.length) {
+          error.textContent = 'Enter at least one CFTools profile URL.';
+          inputs[0]?.focus();
+          return;
+        }
+
+        close(urls);
+      }
+
+      function addRowAfter(row) {
+        const next = createRow();
+        row.insertAdjacentElement('afterend', next);
+        next.querySelector('input').focus();
+      }
+
+      function createRow() {
+        const row = document.createElement('div');
+        row.style.cssText = 'display: flex; gap: 6px; margin-bottom: 6px;';
+
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.placeholder = 'https://app.cftools.cloud/profile/...';
+        input.style.cssText = `
+          flex: 1; min-width: 0; background: #0f1114; color: #fff;
+          border: 1px solid #3a3f46; border-radius: 6px;
+          padding: 7px 9px; font: inherit;
+        `;
+        input.addEventListener('input', () => {
+          input.style.borderColor = '#3a3f46';
+          error.textContent = '';
+        });
+        input.addEventListener('keydown', event => {
+          if (event.key !== 'Enter') return;
+          event.preventDefault();
+
+          if (event.shiftKey) {
+            addRowAfter(row);
+            return;
+          }
+          submit();
+        });
+
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.textContent = '×';
+        remove.title = 'Remove this field';
+        remove.style.cssText = `
+          background: transparent; color: #9aa0a6; border: 1px solid #3a3f46;
+          border-radius: 6px; cursor: pointer; font: inherit; padding: 0 9px;
+        `;
+        remove.addEventListener('click', () => {
+          // The last field stays put: an empty dialog has nothing left to type into.
+          if (rows.children.length === 1) {
+            input.value = '';
+            input.style.borderColor = '#3a3f46';
+            input.focus();
+            return;
+          }
+
+          row.remove();
+          rows.querySelector('input')?.focus();
+        });
+
+        row.append(input, remove);
+        return row;
+      }
+
+      const addButton = createDialogButton('Add another', DIALOG_NEUTRAL_BG, DIALOG_NEUTRAL_HOVER);
+      addButton.addEventListener('click', () => addRowAfter(rows.lastElementChild));
+
+      const spacer = document.createElement('div');
+      spacer.style.cssText = 'flex: 1;';
+
+      const cancelButton = createDialogButton('Cancel', DIALOG_NEUTRAL_BG, DIALOG_NEUTRAL_HOVER);
+      cancelButton.addEventListener('click', () => close(null));
+
+      const compareButton = createDialogButton('Compare', DIALOG_CONFIRM_BG, DIALOG_CONFIRM_HOVER);
+      compareButton.addEventListener('click', () => submit());
+
+      const actions = document.createElement('div');
+      actions.style.cssText = DIALOG_ACTIONS_CSS;
+      actions.append(addButton, spacer, cancelButton, compareButton);
+
+      rows.appendChild(createRow());
+      panel.append(title, hint, rows, error, actions);
+      overlay.appendChild(panel);
+      overlay.addEventListener('mousedown', event => {
+        if (event.target === overlay) close(null);
+      });
+
+      document.addEventListener('keydown', onDocumentKeydown, true);
+      document.body.appendChild(overlay);
+      rows.querySelector('input').focus();
+    });
+  }
+
+  // The multi-target version of buildTraceCompareReport. Unlike the alt report it
+  // keeps the targets that came back empty: these URLs were asked for by hand, so
+  // "nothing shared" is an answer the user wants to see rather than a row to hide.
+  function buildMultiCompareReport(sourceProfile, sourceSteam64, results) {
+    const sourceUrl = sourceProfile?.url || '';
+    const lines = [
+      'Source Account:',
+      sourceSteam64 ? `${sourceUrl} (${sourceSteam64})` : sourceUrl,
+      '',
+      `Compared Against ${results.length} Profile(s):`,
+    ];
+
+    results.forEach(result => {
+      const targetUrl = result.url || '';
+
+      lines.push('');
+      lines.push(result.steam64 ? `${targetUrl} (${result.steam64})` : targetUrl);
+      lines.push('Exact Traces:');
+      lines.push(...(result.sharedTraces.length ? result.sharedTraces : ['None found']));
+      lines.push('Similar Traces:');
+      lines.push(...(result.similarMatches.length ? result.similarMatches : ['None found']));
+      lines.push('Shared IPs:');
+      lines.push(...(result.sharedIps.length ? result.sharedIps : ['None found']));
+    });
+
+    return lines.join('\n');
+  }
+
+  // Both multi-target workflows end the same way, and the alt path reached that
+  // ending from two places with the block copied out twice. reportMode is what
+  // tells the two apart: the Compare Alts button leaves it unset, while Compare
+  // Traces sets it when it hands several URLs to the same stages.
+  async function finishMultiCompare(state, results) {
+    const isExplicitCompare = state.reportMode === 'compare';
+    const report = isExplicitCompare
+      ? buildMultiCompareReport(state.sourceProfile, state.sourceSteam64 || '', results)
+      : buildAltCompareReport(state.sourceProfile, state.sourceSteam64 || '', results);
+    const successToast = isExplicitCompare
+      ? 'Trace comparison copied to clipboard.'
+      : 'Alt comparison copied to clipboard.';
+    const failureToast = isExplicitCompare
+      ? 'Trace comparison ready. Copy failed.'
+      : 'Alt comparison ready. Copy failed.';
+    const returnUrl = state.sourceProfile?.url || '';
+
+    if (returnUrl && returnUrl !== location.href) {
+      saveReportState(state.sourceProfile, report, successToast, failureToast);
+      location.href = returnUrl;
+      return;
+    }
+
+    clearTraceCompareState();
+
+    const copied = await copyText(report);
+    console.log(report);
+    toast(copied ? successToast : failureToast);
+    showReportModal(report, isExplicitCompare ? 'Trace Comparison' : 'Alt Comparison');
+  }
+
   // Button shown on the Identities area for launching a trace compare job.
   function createTraceCompareButton() {
     const btn = document.createElement('button');
@@ -2422,23 +2819,34 @@
     btn.addEventListener('mouseenter', () => (btn.style.background = '#27885b'));
     btn.addEventListener('mouseleave', () => (btn.style.background = '#1f6f4a'));
     btn.addEventListener('click', async () => {
-      const targetUrlInput = (window.prompt('Paste the other profile URL:', '') || '').trim();
-      if (!targetUrlInput) return;
-
-      const targetUrl = normalizeCompareTargetUrl(targetUrlInput);
-      if (!targetUrl) {
-        toast('Please enter a valid CFTools profile URL.');
-        return;
-      }
+      const targetUrls = await promptForCompareUrls();
+      if (!targetUrls?.length) return;
 
       const sourceProfile = getCurrentProfileSummary();
-      saveTraceCompareState({
-        stage: 'collect-source',
-        sourceProfile,
-        targetUrl,
-      });
 
-      toast('Starting trace comparison...');
+      // A single target keeps the original two-profile workflow and the report
+      // shape that goes with it. Several reuse the multi-target stages the alt
+      // compare already runs on, marked so they report as a compare rather than
+      // as an alt hunt.
+      if (targetUrls.length === 1) {
+        saveTraceCompareState({
+          stage: 'collect-source',
+          sourceProfile,
+          targetUrl: targetUrls[0],
+        });
+        toast('Starting trace comparison...');
+      } else {
+        saveTraceCompareState({
+          stage: 'alt-collect-source',
+          sourceProfile,
+          reportMode: 'compare',
+          altUrls: targetUrls,
+          altResults: [],
+          currentAltIndex: 0,
+        });
+        toast(`Starting trace comparison on ${targetUrls.length} profiles...`);
+      }
+
       await resumeTraceCompareWorkflow();
     });
     return btn;
@@ -2678,7 +3086,7 @@
         const copied = await copyText(report);
         console.log(report);
         toast(copied ? 'Trace comparison copied to clipboard.' : 'Trace comparison ready. Copy failed.');
-        window.alert(report);
+        showReportModal(report, 'Trace Comparison');
       }
 
       if (state.stage === 'alt-collect-source') {
@@ -2693,6 +3101,7 @@
         saveTraceCompareState({
           stage: 'alt-collect-target',
           sourceProfile: state.sourceProfile,
+          reportMode: state.reportMode,
           sourceTraces: sourceData.traces,
           sourceIps: sourceData.ips,
           sourceSteam64: sourceData.steam64,
@@ -2708,7 +3117,7 @@
         }
 
         clearTraceCompareState();
-        toast('No Alt Accounts Found');
+        toast(state.reportMode === 'compare' ? 'No profiles to compare.' : 'No Alt Accounts Found');
         return;
       }
 
@@ -2717,29 +3126,7 @@
         const currentAltIndex = state.currentAltIndex || 0;
         const currentAltUrl = altUrls[currentAltIndex];
         if (!currentAltUrl) {
-          const report = buildAltCompareReport(
-            state.sourceProfile,
-            state.sourceSteam64 || '',
-            state.altResults || []
-          );
-          const returnUrl = state.sourceProfile?.url || '';
-
-          if (returnUrl && returnUrl !== location.href) {
-            saveReportState(
-              state.sourceProfile,
-              report,
-              'Alt comparison copied to clipboard.',
-              'Alt comparison ready. Copy failed.'
-            );
-            location.href = returnUrl;
-            return;
-          }
-
-          clearTraceCompareState();
-          const copied = await copyText(report);
-          console.log(report);
-          toast(copied ? 'Alt comparison copied to clipboard.' : 'Alt comparison ready. Copy failed.');
-          window.alert(report);
+          await finishMultiCompare(state, state.altResults || []);
           return;
         }
 
@@ -2749,7 +3136,12 @@
           return;
         }
 
-        const targetData = await collectProfileComparisonData(`alt account ${currentAltIndex + 1}`);
+        // The progress toasts say what the user actually asked for, so a compare
+        // does not narrate itself as an alt hunt.
+        const targetLabel = state.reportMode === 'compare'
+          ? `profile ${currentAltIndex + 1} of ${altUrls.length}`
+          : `alt account ${currentAltIndex + 1}`;
+        const targetData = await collectProfileComparisonData(targetLabel);
         const matches = buildSharedMatchData(
           state.sourceTraces || [],
           targetData.traces,
@@ -2772,6 +3164,7 @@
           saveTraceCompareState({
             stage: 'alt-collect-target',
             sourceProfile: state.sourceProfile,
+            reportMode: state.reportMode,
             sourceTraces: state.sourceTraces || [],
             sourceIps: state.sourceIps || [],
             sourceSteam64: state.sourceSteam64 || '',
@@ -2783,29 +3176,8 @@
           return;
         }
 
-        const report = buildAltCompareReport(
-          state.sourceProfile,
-          state.sourceSteam64 || '',
-          altResults
-        );
-        const returnUrl = state.sourceProfile?.url || '';
-
-        if (returnUrl && returnUrl !== location.href) {
-          saveReportState(
-            state.sourceProfile,
-            report,
-            'Alt comparison copied to clipboard.',
-            'Alt comparison ready. Copy failed.'
-          );
-          location.href = returnUrl;
-          return;
-        }
-
-        clearTraceCompareState();
-        const copied = await copyText(report);
-        console.log(report);
-        toast(copied ? 'Alt comparison copied to clipboard.' : 'Alt comparison ready. Copy failed.');
-        window.alert(report);
+        await finishMultiCompare(state, altResults);
+        return;
       }
 
       if (state.stage === 'show-report') {
@@ -2845,7 +3217,7 @@
         const copied = await copyText(report);
         console.log(report);
         toast(copied ? (state.successToast || 'Trace comparison copied to clipboard.') : (state.failureToast || 'Trace comparison ready. Copy failed.'));
-        window.alert(report);
+        showReportModal(report, 'Trace Comparison');
       }
     } catch (err) {
       console.error('Trace comparison failed:', err);
@@ -2854,6 +3226,1038 @@
     } finally {
       traceCompareRunning = false;
     }
+  }
+
+  /*************** Cheater ban scan ***************/
+  // Walks the dashboard's player list, opens every player wearing a public-ban
+  // badge, and reports back the ones whose ban reasons name them a cheater.
+  //
+  // Like the trace compare, this drives the page rather than calling an API: the
+  // bans only exist in the DOM once a profile's Bans tab has rendered, so the job
+  // navigates the tab and picks itself back up out of sessionStorage after every
+  // load.
+  const CHEATER_SCAN_KEY = 'codex-cheater-scan-state';
+  // Refreshed on every hop, so this is the budget for one profile rather than for
+  // the whole scan, which can legitimately take a while on a full server.
+  const CHEATER_SCAN_RESUME_TTL_MS = 10 * 60 * 1000;
+  // Case-insensitive substring match against the ban reason. "cheat" and
+  // "cheating" are deliberately left out: the reason has to actually say cheater.
+  // Add entries here to widen it.
+  const CHEATER_BAN_KEYWORDS = ['cheater'];
+  // Checked first and wins outright: a ban handed out for associating with a
+  // cheater still says "cheater" in its reason, but it is not a cheater ban.
+  const CHEATER_BAN_EXCLUSIONS = ['association'];
+  // The dashboard renders this badge as "2 public bans"; the profile sidebar uses
+  // "2 public ban(s)". Matching the singular covers both.
+  const PUBLIC_BAN_BADGE_RE = /public ban/i;
+  let cheaterScanRunning = false;
+
+  function loadCheaterScanState() {
+    try {
+      return JSON.parse(sessionStorage.getItem(CHEATER_SCAN_KEY) || 'null');
+    } catch {
+      return null;
+    }
+  }
+
+  // Timestamped on every save so an abandoned scan expires instead of waking up
+  // much later, and so a storage failure is reported rather than escaping out of a
+  // click handler unexplained.
+  function saveCheaterScanState(state) {
+    try {
+      sessionStorage.setItem(CHEATER_SCAN_KEY, JSON.stringify({
+        createdAt: Date.now(),
+        ...state,
+      }));
+      return true;
+    } catch (err) {
+      console.error('Could not save cheater scan state:', err);
+      toast('Could not save scan progress.');
+      return false;
+    }
+  }
+
+  function clearCheaterScanState() {
+    try {
+      sessionStorage.removeItem(CHEATER_SCAN_KEY);
+    } catch (err) {
+      console.error('Could not clear cheater scan state:', err);
+    }
+  }
+
+  function isCheaterScanStateExpired(state) {
+    if (!state?.createdAt) return true;
+    return (Date.now() - state.createdAt) > CHEATER_SCAN_RESUME_TTL_MS;
+  }
+
+  // Query strings and hashes are ignored when checking whether the return trip has
+  // landed: the dashboard route can pick one up on its own, and it is still the
+  // same page.
+  function isSameLocation(a, b) {
+    try {
+      const left = new URL(a || '', location.origin);
+      const right = new URL(b || '', location.origin);
+      return left.origin === right.origin && left.pathname === right.pathname;
+    } catch {
+      return false;
+    }
+  }
+
+  function getDashboardPlayerCards() {
+    return Array.from(document.querySelectorAll('.c-players-col .c-player'));
+  }
+
+  // The visible label of a `.text-copyable` lives in its first text node; the rest
+  // of the span is the offscreen textarea CFTools uses for its own copy button.
+  function getCopyableText(node) {
+    if (!node) return '';
+
+    for (const child of node.childNodes) {
+      if (child.nodeType !== Node.TEXT_NODE) continue;
+      const text = cleanWhitespace(child.textContent);
+      if (text) return text;
+    }
+
+    return getCleanText(node);
+  }
+
+  function getDashboardPlayerName(card) {
+    return getCopyableText(card.querySelector('.c-player-names .c-truncate-text .text-copyable'));
+  }
+
+  // Player rows carry several badge slots (VPN, VAC, public bans). Only a public
+  // ban has a CFTools ban list behind it with a reason to read; a VAC ban is
+  // Steam-side and carries no text to match on.
+  function getPublicBanBadge(card) {
+    for (const badge of card.querySelectorAll('.c-player-badge .badge')) {
+      if (PUBLIC_BAN_BADGE_RE.test(getCleanText(badge))) return badge;
+    }
+    return null;
+  }
+
+  // Every card keeps its "Open profile" link in the collapsed body, so the rows do
+  // not have to be expanded first.
+  function getDashboardPlayerProfileUrl(card) {
+    const href = card.querySelector('a[href*="/profile/"]')?.getAttribute('href');
+    if (!href) return '';
+
+    try {
+      return new URL(href, location.origin).href;
+    } catch {
+      return '';
+    }
+  }
+
+  // Deduplicated by CFTools id: a player who reconnects during the scan can show up
+  // in the list twice, and visiting the same profile twice only pads the report.
+  function getBannedDashboardPlayers() {
+    const players = [];
+    const seen = new Set();
+
+    for (const card of getDashboardPlayerCards()) {
+      const badge = getPublicBanBadge(card);
+      if (!badge) continue;
+
+      const url = getDashboardPlayerProfileUrl(card);
+      const cfid = getCfIdFromUrl(url);
+      if (!url || !cfid || seen.has(cfid)) continue;
+
+      seen.add(cfid);
+      players.push({
+        cfid,
+        url,
+        name: getDashboardPlayerName(card) || cfid,
+        badge: getCleanText(badge),
+      });
+    }
+
+    return players;
+  }
+
+  // The sidebar's Bans entry carries a count badge ("Bans 2 public ban(s)"), so the
+  // exact-text match findProfileLink uses cannot find it.
+  function findBansProfileLink() {
+    for (const link of document.querySelectorAll('.profile-links .profile-link')) {
+      if (link.classList.contains('profile-server-link')) continue;
+      if (/^bans$/i.test(getOwnText(link))) return link;
+    }
+    return null;
+  }
+
+  // The Bans view renders a plain bootstrap-vue table. Matching on its header text
+  // rather than on an id keeps this working when CFTools renumbers its __BVID__s.
+  function findBanTable() {
+    for (const table of document.querySelectorAll('table')) {
+      const headers = Array.from(table.querySelectorAll('thead th'))
+        .map(th => getCleanText(th).toLowerCase());
+      if (headers.includes('ban list') && headers.includes('reason')) return table;
+    }
+    return null;
+  }
+
+  // Column positions are read off the header row instead of being hard-coded, so an
+  // added or reordered column cannot shift the reason out from under us. Expires is
+  // read past rather than recorded: the report does not quote it.
+  function getBanTableColumnIndexes(table) {
+    const indexes = {};
+
+    Array.from(table.querySelectorAll('thead th')).forEach((th, index) => {
+      const label = getCleanText(th).toLowerCase();
+      if (label && !(label in indexes)) indexes[label] = index;
+    });
+
+    return indexes;
+  }
+
+  // The ban list cell also holds the game-mode badge and a hidden preview card, so
+  // only the cell's own text is the list's name.
+  function getBanListName(cell) {
+    const header = cell?.querySelector('.c-banlist-header');
+    if (!header) return getCleanText(cell);
+    return getOwnText(header) || getCleanText(header);
+  }
+
+  function readBansFromPage() {
+    const table = findBanTable();
+    if (!table) return [];
+
+    const indexes = getBanTableColumnIndexes(table);
+    const bans = [];
+
+    for (const row of table.querySelectorAll('tbody tr')) {
+      const cells = Array.from(row.querySelectorAll('td'));
+      if (!cells.length) continue;
+
+      const cellText = label => {
+        const index = indexes[label];
+        return index === undefined ? '' : getCleanText(cells[index]);
+      };
+
+      bans.push({
+        banList: getBanListName(cells[indexes['ban list']]),
+        issued: cellText('issue date'),
+        reason: cellText('reason'),
+      });
+    }
+
+    return bans;
+  }
+
+  function isCheaterBan(ban) {
+    const reason = (ban?.reason || '').toLowerCase();
+    if (!reason) return false;
+    if (CHEATER_BAN_EXCLUSIONS.some(keyword => reason.includes(keyword))) return false;
+    return CHEATER_BAN_KEYWORDS.some(keyword => reason.includes(keyword));
+  }
+
+  // Opens the profile's Bans tab and reads the table out of it.
+  async function collectProfileBans(label) {
+    toast(`Checking ${label}...`, 2500);
+    await waitForPageReady();
+
+    const bansLink = await waitForElement(() => findBansProfileLink(), 15000, 100);
+    if (!bansLink.classList.contains('profile-link-active')) {
+      clickElement(bansLink);
+      await waitForElement(
+        () => findBansProfileLink()?.classList.contains('profile-link-active') || null,
+        10000,
+        100
+      );
+    }
+
+    // A missing table is a result, not a failure: the badge counts can lag, and a
+    // profile can end up on the Bans tab with nothing to show. The shorter wait
+    // keeps that case from costing the full element timeout on every player.
+    try {
+      await waitForElement(() => findBanTable(), 8000, 100);
+    } catch {
+      debugLog('[CFTools Tools] Cheater scan: no ban table rendered for', label);
+      return [];
+    }
+
+    return readBansFromPage();
+  }
+
+  function buildCheaterScanReport(state) {
+    if (state.mode === 'multi') return buildMultiServerCheaterScanReport(state);
+
+    const results = state.results || [];
+    const flagged = results.filter(result => result.matches?.length);
+    const keywords = CHEATER_BAN_KEYWORDS.join(' / ');
+
+    const lines = [
+      'Cheater Ban Scan',
+      `Players with a ${keywords} ban: ${flagged.length}`,
+      '',
+      'Flagged Players:',
+    ];
+
+    if (!flagged.length) {
+      lines.push('None found');
+    } else {
+      flagged.forEach((result, index) => {
+        if (index > 0) lines.push('');
+        lines.push(`${result.name} - ${result.url}`);
+
+        result.matches.forEach(ban => {
+          const suffix = ban.issued ? ` (issued ${ban.issued})` : '';
+          lines.push(`- [${ban.banList || 'Unknown ban list'}] ${ban.reason || 'No reason given'}${suffix}`);
+        });
+      });
+    }
+
+    return lines.join('\n');
+  }
+
+  async function showCheaterScanReport(report) {
+    // The run is over by the time this is called, so the stop button goes before
+    // the report does rather than lingering behind it until the next refresh.
+    ensureCheaterScanStopButton();
+
+    const copied = await copyText(report);
+    console.log(report);
+    toast(copied ? 'Cheater scan copied to clipboard.' : 'Cheater scan ready. Copy failed.');
+    showReportModal(report, 'Cheater Ban Scan');
+  }
+
+  // The dashboard is a different page by the time the queue runs dry, so the report
+  // rides along in the saved state and is shown once the return trip lands.
+  async function finishCheaterScan(state) {
+    const report = buildCheaterScanReport(state);
+
+    if (state.returnUrl && !isSameLocation(state.returnUrl, location.href)) {
+      if (saveCheaterScanState({ stage: 'show-report', returnUrl: state.returnUrl, report })) {
+        location.href = state.returnUrl;
+        return;
+      }
+    }
+
+    clearCheaterScanState();
+    await showCheaterScanReport(report);
+  }
+
+  // Three-stage workflow:
+  // 1. Queue up every dashboard player carrying a public ban.
+  // 2. Visit each of their profiles in turn, reading the Bans tab on each.
+  // 3. Navigate back to the dashboard and show the report there.
+  async function resumeCheaterScanWorkflow() {
+    if (cheaterScanRunning) return;
+
+    const state = loadCheaterScanState();
+    if (!state) return;
+    if (isCheaterScanStateExpired(state)) {
+      clearCheaterScanState();
+      return;
+    }
+
+    cheaterScanRunning = true;
+
+    try {
+      if (state.stage === 'collect') {
+        const queue = state.queue || [];
+        const index = state.index || 0;
+        const player = queue[index];
+
+        if (!player) {
+          await finishCheaterScan(state);
+          return;
+        }
+
+        // Resumed somewhere other than the profile we were sent to, most likely
+        // because the user navigated away mid-scan. Leave the state alone so the
+        // job picks up again if they come back, and let the TTL clear it if not.
+        const currentCfid = getCfId();
+        if (!currentCfid || currentCfid !== player.cfid) return;
+
+        const results = [...(state.results || [])];
+
+        // A profile that will not load is one skipped player, not a dead scan, so the
+        // failure goes to the console and the queue moves on.
+        try {
+          const bans = await collectProfileBans(`${player.name} (${index + 1}/${queue.length})`);
+          results.push({
+            name: player.name,
+            url: player.url,
+            matches: bans.filter(isCheaterBan),
+          });
+        } catch (err) {
+          console.error(`Cheater scan could not read ${player.url}:`, err);
+        }
+
+        if (isCheaterScanCancelled()) return;
+
+        const nextState = { ...state, stage: 'collect', index: index + 1, results };
+        const nextPlayer = queue[index + 1];
+
+        if (!nextPlayer) {
+          await finishCheaterScan(nextState);
+          return;
+        }
+
+        if (!saveCheaterScanState(nextState)) {
+          clearCheaterScanState();
+          return;
+        }
+
+        location.href = nextPlayer.url;
+        return;
+      }
+
+      if (state.stage === 'server-collect') {
+        const servers = state.serverQueue || [];
+        const serverIndex = state.serverIndex || 0;
+        const server = servers[serverIndex];
+
+        if (!server) {
+          await startCheaterScanProfilePhase(state);
+          return;
+        }
+
+        // Not on the dashboard we were sent to: either still on the way, or the
+        // user has navigated off mid-sweep.
+        if (getDashboardServerIdFromUrl() !== server.id) return;
+
+        // A server whose list never renders is one gap in the report, not a dead
+        // sweep, so the failure goes to the console and the queue moves on.
+        let players = [];
+        try {
+          toast(`Reading ${server.name} (${serverIndex + 1}/${servers.length})...`, 2500);
+          await waitForDashboardPlayerList();
+          players = getBannedDashboardPlayers();
+        } catch (err) {
+          console.error(`Ban scan could not read the player list for ${server.name}:`, err);
+        }
+
+        if (isCheaterScanCancelled()) return;
+
+        const serverPlayers = { ...(state.serverPlayers || {}), [server.id]: players };
+        const nextState = { ...state, serverPlayers, serverIndex: serverIndex + 1 };
+        const nextServer = servers[serverIndex + 1];
+
+        if (!nextServer) {
+          await startCheaterScanProfilePhase(nextState);
+          return;
+        }
+
+        if (!saveCheaterScanState(nextState)) {
+          clearCheaterScanState();
+          return;
+        }
+
+        location.href = nextServer.url;
+        return;
+      }
+
+      if (state.stage === 'profile-collect') {
+        const queue = state.profileQueue || [];
+        const index = state.profileIndex || 0;
+        const player = queue[index];
+
+        if (!player) {
+          await finishCheaterScan(state);
+          return;
+        }
+
+        const currentCfid = getCfId();
+        if (!currentCfid || currentCfid !== player.cfid) return;
+
+        const banMatches = { ...(state.banMatches || {}) };
+
+        try {
+          const bans = await collectProfileBans(`${player.name} (${index + 1}/${queue.length})`);
+          banMatches[player.cfid] = bans.filter(isCheaterBan);
+        } catch (err) {
+          console.error(`Ban scan could not read ${player.url}:`, err);
+          banMatches[player.cfid] = [];
+        }
+
+        if (isCheaterScanCancelled()) return;
+
+        const nextState = { ...state, banMatches, profileIndex: index + 1 };
+        const nextPlayer = queue[index + 1];
+
+        if (!nextPlayer) {
+          await finishCheaterScan(nextState);
+          return;
+        }
+
+        if (!saveCheaterScanState(nextState)) {
+          clearCheaterScanState();
+          return;
+        }
+
+        location.href = nextPlayer.url;
+        return;
+      }
+
+      if (state.stage === 'show-report') {
+        // Still on the way back to where the scan was started from.
+        if (state.returnUrl && !isSameLocation(state.returnUrl, location.href)) return;
+
+        const report = state.report || 'No players scanned.';
+        clearCheaterScanState();
+        await showCheaterScanReport(report);
+      }
+    } catch (err) {
+      console.error('Cheater scan failed:', err);
+      clearCheaterScanState();
+      toast('Cheater scan failed. Check console for details.');
+    } finally {
+      cheaterScanRunning = false;
+    }
+  }
+
+  async function startCheaterScan() {
+    // An expired leftover is not a running scan: it would otherwise block every
+    // later scan until a refresh happened to clear it.
+    const pending = loadCheaterScanState();
+    if (cheaterScanRunning || (pending && !isCheaterScanStateExpired(pending))) {
+      toast('A cheater scan is already running.');
+      return;
+    }
+
+    const players = getBannedDashboardPlayers();
+    if (!players.length) {
+      toast('No players with public bans in this list.');
+      return;
+    }
+
+    const saved = saveCheaterScanState({
+      stage: 'collect',
+      returnUrl: location.href,
+      queue: players,
+      index: 0,
+      results: [],
+    });
+    if (!saved) return;
+
+    toast(`Starting cheater scan on ${players.length} player(s)...`);
+    location.href = players[0].url;
+  }
+
+  // Button shown on the dashboard's player-list toolbar, attached to the right-hand
+  // edge of the Search field the way the Sort group's own button is.
+  function createCheaterScanButton() {
+    const btn = document.createElement('button');
+    btn.id = 'cheater-scan-btn';
+    btn.type = 'button';
+    btn.className = 'btn btn-outline-danger btn-sm';
+    btn.textContent = 'Scan Bans';
+    btn.title = 'Open every player carrying a public ban and report the ones banned as a cheater';
+    btn.addEventListener('click', () => {
+      startCheaterScan().catch(err => {
+        console.error('Cheater scan failed to start:', err);
+        toast('Cheater scan failed to start. Check console for details.');
+      });
+    });
+    return btn;
+  }
+
+  // Anchored to the Search label rather than to a column position, because the
+  // toolbar's grid classes are shared with every other input group on the page.
+  function findDashboardSearchInputGroup() {
+    for (const label of document.querySelectorAll('.c-players-col .input-group .input-group-text')) {
+      if (getCleanText(label).toLowerCase() !== 'search') continue;
+
+      const group = label.closest('.input-group');
+      if (group) return group;
+    }
+    return null;
+  }
+
+  function removeCheaterScanButton() {
+    document.getElementById('cheater-scan-slot')?.remove();
+  }
+
+  function ensureCheaterScanButton() {
+    if (!isCheaterScanButtonEnabled()) {
+      removeCheaterScanButton();
+      return;
+    }
+
+    const group = findDashboardSearchInputGroup();
+    if (!group) {
+      removeCheaterScanButton();
+      return;
+    }
+
+    const existing = document.getElementById('cheater-scan-slot');
+    // The append has to stay last inside the group, or bootstrap rounds the wrong
+    // edge. A Vue rerender of the search field can drop it back in the middle.
+    if (existing && existing.parentElement === group && existing === group.lastElementChild) return;
+
+    const slot = existing || document.createElement('div');
+    if (!existing) {
+      slot.id = 'cheater-scan-slot';
+      slot.className = 'input-group-append';
+      slot.appendChild(createCheaterScanButton());
+    }
+
+    group.appendChild(slot);
+  }
+
+  /*************** Cheater ban scan: whole-server sweep ***************/
+  // The player-list button scans the server you are looking at. This one scans a
+  // set of them: it walks each selected server's dashboard collecting the banned
+  // players, then visits every one of those profiles, then comes back and reports
+  // per server.
+  const DASHBOARD_ID_RE = /\/dashboard\/([a-f0-9]{24})(?:\/|$)/i;
+  // The stages a run can be interrupted during, which is also when the stop button
+  // is worth showing.
+  const CHEATER_SCAN_ACTIVE_STAGES = ['collect', 'server-collect', 'profile-collect'];
+
+  function getDashboardServerIdFromUrl(href = location.href) {
+    try {
+      const match = DASHBOARD_ID_RE.exec(new URL(href, location.origin).pathname);
+      return match ? match[1].toLowerCase() : '';
+    } catch {
+      return '';
+    }
+  }
+
+  function buildDashboardUrl(serverId) {
+    return new URL(`/dashboard/${serverId}`, location.origin).href;
+  }
+
+  // The picker's last selection, kept in the script's own Tampermonkey storage so
+  // it survives a restart and is shared with the other CFTools tabs.
+  function loadSelectedScanServerIds() {
+    if (!HAS_GM_STORAGE) return [];
+
+    try {
+      const parsed = JSON.parse(GM_getValue(CHEATER_SCAN_SERVERS_STORAGE_KEY, '[]'));
+      return Array.isArray(parsed) ? parsed.filter(id => typeof id === 'string') : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function saveSelectedScanServerIds(serverIds) {
+    if (!HAS_GM_STORAGE) return;
+
+    try {
+      GM_setValue(CHEATER_SCAN_SERVERS_STORAGE_KEY, JSON.stringify(serverIds));
+    } catch (err) {
+      console.error('Could not save the scan server selection:', err);
+    }
+  }
+
+  // Checkbox picker over the servers CFTools' own nav says you have access to.
+  // Resolves with the chosen ids, or null if it was cancelled.
+  function openScanServerPicker(servers) {
+    const open = document.getElementById('cheater-scan-picker');
+    if (open) {
+      open.querySelector('input')?.focus();
+      return Promise.resolve(null);
+    }
+
+    return new Promise(resolve => {
+      const previous = new Set(loadSelectedScanServerIds());
+
+      const overlay = document.createElement('div');
+      overlay.id = 'cheater-scan-picker';
+      overlay.style.cssText = DIALOG_OVERLAY_CSS;
+
+      const panel = document.createElement('div');
+      panel.style.cssText = DIALOG_PANEL_CSS;
+
+      const title = document.createElement('div');
+      title.textContent = 'Scan Bans';
+      title.style.cssText = DIALOG_TITLE_CSS;
+
+      const hint = document.createElement('div');
+      hint.textContent = 'Pick the servers to sweep. Each one is opened in turn, and every player on it carrying a public ban gets their profile checked.';
+      hint.style.cssText = DIALOG_HINT_CSS;
+
+      const list = document.createElement('div');
+      list.style.cssText = `
+        max-height: 45vh; overflow: auto; border: 1px solid #2c313a;
+        border-radius: 6px; padding: 6px 8px;
+      `;
+
+      const error = document.createElement('div');
+      error.style.cssText = DIALOG_ERROR_CSS;
+
+      const boxes = servers.map(server => {
+        const row = document.createElement('label');
+        row.style.cssText = 'display: flex; align-items: center; gap: 8px; padding: 5px 2px; cursor: pointer;';
+
+        const box = document.createElement('input');
+        box.type = 'checkbox';
+        box.value = server.id;
+        box.checked = previous.has(server.id);
+        box.style.cssText = 'width: 15px; height: 15px; accent-color: #1f6f4a; flex: none;';
+        box.addEventListener('change', () => {
+          error.textContent = '';
+        });
+
+        const name = document.createElement('span');
+        name.textContent = server.name;
+
+        row.append(box, name);
+        list.appendChild(row);
+        return box;
+      });
+
+      function close(result) {
+        document.removeEventListener('keydown', onDocumentKeydown, true);
+        overlay.remove();
+        resolve(result);
+      }
+
+      function onDocumentKeydown(event) {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          close(null);
+          return;
+        }
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          submit();
+        }
+      }
+
+      function submit() {
+        const chosen = boxes.filter(box => box.checked).map(box => box.value);
+        if (!chosen.length) {
+          error.textContent = 'Pick at least one server.';
+          return;
+        }
+        close(chosen);
+      }
+
+      const allButton = createDialogButton('Select all', DIALOG_NEUTRAL_BG, DIALOG_NEUTRAL_HOVER);
+      allButton.addEventListener('click', () => {
+        boxes.forEach(box => (box.checked = true));
+        error.textContent = '';
+      });
+
+      const noneButton = createDialogButton('Select none', DIALOG_NEUTRAL_BG, DIALOG_NEUTRAL_HOVER);
+      noneButton.addEventListener('click', () => boxes.forEach(box => (box.checked = false)));
+
+      const spacer = document.createElement('div');
+      spacer.style.cssText = 'flex: 1;';
+
+      const cancelButton = createDialogButton('Cancel', DIALOG_NEUTRAL_BG, DIALOG_NEUTRAL_HOVER);
+      cancelButton.addEventListener('click', () => close(null));
+
+      const scanButton = createDialogButton('Scan', DIALOG_CONFIRM_BG, DIALOG_CONFIRM_HOVER);
+      scanButton.addEventListener('click', () => submit());
+
+      const actions = document.createElement('div');
+      actions.style.cssText = DIALOG_ACTIONS_CSS;
+      actions.append(allButton, noneButton, spacer, cancelButton, scanButton);
+
+      panel.append(title, hint, list, error, actions);
+      overlay.appendChild(panel);
+      overlay.addEventListener('mousedown', event => {
+        if (event.target === overlay) close(null);
+      });
+
+      document.addEventListener('keydown', onDocumentKeydown, true);
+      document.body.appendChild(overlay);
+      (boxes.find(box => box.checked) || boxes[0])?.focus();
+    });
+  }
+
+  // The sidebar card for a server carries its live player count ("20 / 115"), which
+  // is the only thing on the page that says how long the list still has to go. It
+  // can be a moment stale either way, so it is a fast path rather than the whole
+  // answer: hitting it ends the wait immediately, missing it falls through to the
+  // settle window below.
+  function getExpectedDashboardPlayerCount(serverId) {
+    if (!serverId) return null;
+
+    for (const link of document.querySelectorAll(SERVER_LINK_SELECTOR)) {
+      if (getServerIdFromHref(link.getAttribute('href')) !== serverId) continue;
+
+      const card = findServerCardForLink(link, serverId);
+      const match = /(\d+)\s*\/\s*\d+/.exec(getCleanText(card.querySelector('.badge')));
+      if (match) return Number(match[1]);
+    }
+
+    return null;
+  }
+
+  // How long the card total has to hold still before the list counts as finished.
+  // Cards on screen settle fast; an empty list has to be waited out, and is given
+  // less rope when the nav agrees the server is empty.
+  function getDashboardListSettleMs(count, expected) {
+    if (count > 0) return 600;
+    return expected === 0 ? 1200 : 4000;
+  }
+
+  // The list paints over several frames and an empty server never paints a card at
+  // all, so short of the count above this waits for the card total to stop moving
+  // rather than for a card to turn up. Without either, a fast hop reads a
+  // half-rendered list and under-reports.
+  async function waitForDashboardPlayerList(timeoutMs = 25000) {
+    const serverId = getDashboardServerIdFromUrl();
+    await waitForElement(() => findDashboardSearchInputGroup(), timeoutMs, 100);
+
+    // Read once the toolbar is up, by which point the nav has long rendered.
+    const expected = getExpectedDashboardPlayerCount(serverId);
+    const started = Date.now();
+    let lastCount = -1;
+    let stableSince = Date.now();
+
+    while (Date.now() - started < timeoutMs) {
+      const count = getDashboardPlayerCards().length;
+
+      // Everyone the nav knows about is on screen, so there is nothing to settle.
+      // Only a positive count is trusted outright: a nav that has not filled in yet
+      // also reads as 0, and taking that at face value would skip a busy server.
+      if (expected && count >= expected) return count;
+
+      if (count !== lastCount) {
+        lastCount = count;
+        stableSince = Date.now();
+      } else if (Date.now() - stableSince > getDashboardListSettleMs(count, expected)) {
+        return count;
+      }
+
+      await delay(100);
+    }
+
+    return getDashboardPlayerCards().length;
+  }
+
+  // The stop button clears the saved state out from under a run that is already
+  // mid-flight, so every hop re-checks that the job it is continuing is still
+  // wanted before it saves progress or navigates anywhere.
+  function isCheaterScanCancelled() {
+    try {
+      return !sessionStorage.getItem(CHEATER_SCAN_KEY);
+    } catch {
+      return false;
+    }
+  }
+
+  // Deliberately not a full parse: during a large sweep that JSON holds every
+  // queued player, and this runs on every refresh.
+  function hasActiveCheaterScan() {
+    let raw = '';
+    try {
+      raw = sessionStorage.getItem(CHEATER_SCAN_KEY) || '';
+    } catch {
+      return false;
+    }
+    if (!raw) return false;
+
+    return CHEATER_SCAN_ACTIVE_STAGES.some(stage => raw.includes(`"stage":"${stage}"`));
+  }
+
+  function createCheaterScanStopButton() {
+    const btn = document.createElement('button');
+    btn.id = 'cheater-scan-stop-btn';
+    btn.type = 'button';
+    btn.textContent = 'Stop ban scan';
+    btn.style.cssText = `
+      position: fixed; right: 16px; bottom: 16px; z-index: 2147483646;
+      background: #c0392b; color: #fff; border: none; border-radius: 999px;
+      cursor: pointer; font: 13px system-ui,sans-serif; padding: 9px 16px;
+      box-shadow: 0 8px 25px rgba(0,0,0,.35);
+    `;
+    btn.addEventListener('mouseenter', () => (btn.style.background = '#e74c3c'));
+    btn.addEventListener('mouseleave', () => (btn.style.background = '#c0392b'));
+    btn.addEventListener('click', () => {
+      clearCheaterScanState();
+      btn.remove();
+      toast('Ban scan stopped.');
+    });
+    return btn;
+  }
+
+  // Not gated on the button toggle: hiding the entry points should not strip the
+  // only way to call off a run that is already going.
+  function ensureCheaterScanStopButton() {
+    const existing = document.getElementById('cheater-scan-stop-btn');
+
+    if (!hasActiveCheaterScan()) {
+      existing?.remove();
+      return;
+    }
+    if (existing) return;
+
+    document.body.appendChild(createCheaterScanStopButton());
+  }
+
+  async function startMultiServerCheaterScan() {
+    const pending = loadCheaterScanState();
+    if (cheaterScanRunning || (pending && !isCheaterScanStateExpired(pending))) {
+      toast('A ban scan is already running.');
+      return;
+    }
+
+    const servers = readServerMap();
+    if (!servers.length) {
+      toast('No servers found in the sidebar.');
+      return;
+    }
+
+    const chosenIds = await openScanServerPicker(servers);
+    if (!chosenIds?.length) return;
+
+    saveSelectedScanServerIds(chosenIds);
+
+    // Built from the nav's own order so the report reads the way the sidebar does.
+    const serverQueue = servers
+      .filter(server => chosenIds.includes(server.id))
+      .map(server => ({ id: server.id, name: server.name, url: buildDashboardUrl(server.id) }));
+    if (!serverQueue.length) return;
+
+    const saved = saveCheaterScanState({
+      stage: 'server-collect',
+      mode: 'multi',
+      returnUrl: location.href,
+      serverQueue,
+      serverIndex: 0,
+      serverPlayers: {},
+    });
+    if (!saved) return;
+
+    toast(`Starting ban scan on ${serverQueue.length} server(s)...`);
+    location.href = serverQueue[0].url;
+  }
+
+  // Every server has been read, so the players are flattened into one visit list.
+  // A player online on two selected servers is visited once and then reported
+  // under both, which the per-server layout gets for free.
+  async function startCheaterScanProfilePhase(state) {
+    const serverPlayers = state.serverPlayers || {};
+    const profileQueue = [];
+    const seen = new Set();
+
+    for (const server of state.serverQueue || []) {
+      for (const player of serverPlayers[server.id] || []) {
+        if (seen.has(player.cfid)) continue;
+        seen.add(player.cfid);
+        profileQueue.push(player);
+      }
+    }
+
+    const nextState = {
+      ...state,
+      stage: 'profile-collect',
+      profileQueue,
+      profileIndex: 0,
+      banMatches: {},
+    };
+
+    if (!profileQueue.length) {
+      await finishCheaterScan(nextState);
+      return;
+    }
+
+    if (!saveCheaterScanState(nextState)) {
+      clearCheaterScanState();
+      return;
+    }
+
+    location.href = profileQueue[0].url;
+  }
+
+  function buildMultiServerCheaterScanReport(state) {
+    const servers = state.serverQueue || [];
+    const serverPlayers = state.serverPlayers || {};
+    const banMatches = state.banMatches || {};
+    const flaggedCfids = new Set();
+    const lines = [];
+
+    // A server only earns a section by having someone to report. A sweep of a dozen
+    // servers is mostly quiet ones, and listing them all buries the hits.
+    servers.forEach(server => {
+      const flagged = (serverPlayers[server.id] || [])
+        .filter(player => (banMatches[player.cfid] || []).length);
+      if (!flagged.length) return;
+
+      lines.push('');
+      lines.push(server.name);
+
+      flagged.forEach(player => {
+        flaggedCfids.add(player.cfid);
+        lines.push(`${player.name} - ${player.url}`);
+
+        banMatches[player.cfid].forEach(ban => {
+          const suffix = ban.issued ? ` (issued ${ban.issued})` : '';
+          lines.push(`- [${ban.banList || 'Unknown ban list'}] ${ban.reason || 'No reason given'}${suffix}`);
+        });
+      });
+    });
+
+    if (!lines.length) {
+      lines.push('');
+      lines.push('None found');
+    }
+
+    return [
+      'Cheater Ban Scan',
+      `Players with a ${CHEATER_BAN_KEYWORDS.join(' / ')} ban: ${flaggedCfids.size}`,
+      ...lines,
+    ].join('\n');
+  }
+
+  // Sidebar entry point, sat on the Servers heading with the add-server and
+  // nav-settings icons. The heading has no room for a labelled button, so it is an
+  // icon in their style: a red magnifying glass, with the tooltip carrying the
+  // wording.
+  function createCheaterScanServersButton() {
+    const slot = document.createElement('div');
+    slot.id = 'cheater-scan-servers-slot';
+    slot.className = 'd-inline-block float-right ml-1 mr-1';
+
+    const link = document.createElement('a');
+    link.href = 'javascript: void(0);';
+    link.className = 'p-0 m-0 float-right';
+    link.title = 'Scan Bans: sweep servers for players banned as cheaters';
+    // The neighbouring icons carry these overrides, so a plain anchor here would be
+    // laid out differently to the two sat next to it.
+    link.style.cssText = 'pointer-events: auto !important; position: unset !important; display: unset !important;';
+
+    const icon = document.createElement('i');
+    icon.className = 'fad fa-search text-danger align-middle';
+    icon.style.cssText = 'font-size: 20px;';
+
+    link.appendChild(icon);
+    link.addEventListener('click', event => {
+      event.preventDefault();
+      startMultiServerCheaterScan().catch(err => {
+        console.error('Ban scan failed to start:', err);
+        toast('Ban scan failed to start. Check console for details.');
+      });
+    });
+
+    slot.appendChild(link);
+    return slot;
+  }
+
+  function findServersMenuTitle() {
+    for (const item of document.querySelectorAll('#side-menu li.menu-title')) {
+      if (/^servers$/i.test(getCleanText(item))) return item;
+    }
+    return null;
+  }
+
+  function ensureCheaterScanServersButton() {
+    const existing = document.getElementById('cheater-scan-servers-slot');
+
+    if (!isCheaterScanButtonEnabled()) {
+      existing?.remove();
+      return;
+    }
+
+    const heading = findServersMenuTitle();
+    if (!heading) {
+      existing?.remove();
+      return;
+    }
+
+    // The heading's right-hand half is the tray the other two icons float in.
+    const tray = heading.querySelector('.d-inline-block.align-middle') || heading;
+    if (existing && existing.parentElement === tray) return;
+
+    existing?.remove();
+    tray.appendChild(createCheaterScanServersButton());
   }
 
   // Button shown in the profile header that prepares a Discord ban-entry template.
@@ -2989,8 +4393,14 @@
     ensureBanEntryButton();
     ensureTraceCompareButton();
     ensureAltCompareButton();
+    ensureCheaterScanButton();
+    ensureCheaterScanServersButton();
+    ensureCheaterScanStopButton();
     resumeTraceCompareWorkflow().catch(err => {
       console.error('Trace comparison failed:', err);
+    });
+    resumeCheaterScanWorkflow().catch(err => {
+      console.error('Cheater scan failed:', err);
     });
   });
   const scheduleServerLogsRefresh = makeScheduler(() => {
@@ -3013,17 +4423,19 @@
 
   // CFTools sometimes renders a route in multiple passes.
   // These follow-up refreshes give profile helpers another chance to attach
-  // after the header/sidebar finishes painting.
+  // after the header/sidebar finishes painting. The dashboard needs them too now
+  // that the Scan Bans button and the scan report both land on the player list,
+  // so the guard only skips the one route with no profile-side helper on it.
   const PROFILE_REFRESH_RETRY_DELAYS_MS = [250, 1000, 2500, 5000, 10000, 15000];
   let profileRefreshRetryToken = 0;
 
   function queueProfileRefreshFollowUps() {
-    if (!isProfilePage()) return;
+    if (isServerLogsPage()) return;
 
     const retryToken = ++profileRefreshRetryToken;
     for (const delayMs of PROFILE_REFRESH_RETRY_DELAYS_MS) {
       window.setTimeout(() => {
-        if (profileRefreshRetryToken !== retryToken || !isProfilePage()) return;
+        if (profileRefreshRetryToken !== retryToken || isServerLogsPage()) return;
         scheduleProfileRefresh();
       }, delayMs);
     }
@@ -3038,7 +4450,7 @@
   // class is cheaper and equivalent here.
   // `.profile-link-active` needs no entry: class changes land on an element that
   // already matches `.profile-link` / `.profile-server-link`.
-  const PROFILE_OBSERVER_SELECTOR = '.profile-container-left, .profile-container-item, .mobile-profile-container-item, .text-copyable.text-code, .profile-links, .profile-link, .profile-server-link, .c-page-header, .c-nav, .c-nav-item, .c-nav-link, .page-title-card, .card-body, .card-title';
+  const PROFILE_OBSERVER_SELECTOR = '.profile-container-left, .profile-container-item, .mobile-profile-container-item, .text-copyable.text-code, .profile-links, .profile-link, .profile-server-link, .c-page-header, .c-nav, .c-nav-item, .c-nav-link, .page-title-card, .card-body, .card-title, .menu-title';
   const SERVER_LOGS_OBSERVER_SELECTOR = 'table, tbody, tr';
 
   scheduleCoordRefresh();
