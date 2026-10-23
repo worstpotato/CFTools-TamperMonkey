@@ -2348,7 +2348,7 @@
     ].join('\n');
   }
 
-  function buildAltCompareReport(sourceProfile, sourceSteam64, altResults) {
+  function buildAltCompareReport(sourceProfile, sourceSteam64, altResults, pairs) {
     const sourceUrl = sourceProfile?.url || '';
     const sourceAccountLine = sourceSteam64 ? `${sourceUrl} (${sourceSteam64})` : sourceUrl;
     // A shared IP alone is still worth reporting, so the header stays broader
@@ -2369,7 +2369,6 @@
 
     if (!matchedAltResults.length) {
       lines.push('None found');
-      return lines.join('\n');
     }
 
     matchedAltResults.forEach((result, index) => {
@@ -2386,14 +2385,19 @@
       lines.push(...(result.sharedIps.length ? result.sharedIps : ['None found']));
     });
 
+    // pairs covers every alt, not just the matched ones: two alts can share
+    // traces with each other while neither matches the source.
+    appendTargetPairSection(lines, pairs || [], 'Between Alt Accounts:');
+
     return lines.join('\n');
   }
 
-  function saveReportState(sourceProfile, report, successToast, failureToast) {
+  function saveReportState(sourceProfile, report, successToast, failureToast, graph) {
     saveTraceCompareState({
       stage: 'show-report',
       sourceProfile,
       report,
+      graph,
       successToast,
       failureToast,
     });
@@ -2503,7 +2507,348 @@
     }
   }
 
-  function showReportModal(report, title = 'Report') {
+  // Multi-profile reports read as a wall of URLs, so the report window also draws
+  // the accounts as boxes with a line between every pair that shares something,
+  // labelled with what they share. It is a canvas rather than DOM so the exact
+  // same drawing can be copied as a PNG.
+  const GRAPH_SCALE = 2;
+  const GRAPH_FONT = '12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+  const GRAPH_NODE_FONT = '600 13px system-ui, sans-serif';
+  const GRAPH_LINE_HEIGHT = 16;
+  const GRAPH_NODE_WIDTH = 170;
+  const GRAPH_NODE_HEIGHT = 44;
+  const GRAPH_LABEL_PADDING = 6;
+  const GRAPH_LABEL_MAX_ENTRIES = 8;
+  const GRAPH_LABEL_MAX_TEXT_WIDTH = 220;
+  const GRAPH_MARGIN = 24;
+  const GRAPH_COLORS = {
+    background: '#0f1114',
+    edge: '#5c6470',
+    nodeFill: '#1d2129',
+    nodeBorder: '#3a414c',
+    sourceBorder: '#27885b',
+    labelFill: '#16181d',
+    labelBorder: '#2c313a',
+    text: '#e8eaed',
+    muted: '#9aa0a6',
+    similar: '#f0b35a',
+    ip: '#6fb1ff',
+  };
+
+  function fitGraphText(ctx, text, maxWidth) {
+    if (ctx.measureText(text).width <= maxWidth) return text;
+
+    let trimmed = text;
+    while (trimmed.length > 1 && ctx.measureText(`${trimmed}…`).width > maxWidth) {
+      trimmed = trimmed.slice(0, -1);
+    }
+    return `${trimmed}…`;
+  }
+
+  function traceGraphRoundRect(ctx, x, y, width, height, radius) {
+    ctx.beginPath();
+    ctx.moveTo(x + radius, y);
+    ctx.arcTo(x + width, y, x + width, y + height, radius);
+    ctx.arcTo(x + width, y + height, x, y + height, radius);
+    ctx.arcTo(x, y + height, x, y, radius);
+    ctx.arcTo(x, y, x + width, y, radius);
+    ctx.closePath();
+  }
+
+  function getGraphEdgeLines(edge) {
+    const entries = [
+      ...edge.exact.map(text => ({ text, color: GRAPH_COLORS.text })),
+      ...edge.similar.map(text => ({ text: `~ ${text}`, color: GRAPH_COLORS.similar })),
+      ...edge.ips.map(text => ({ text: `IP ${text}`, color: GRAPH_COLORS.ip })),
+    ];
+    if (entries.length <= GRAPH_LABEL_MAX_ENTRIES) return entries;
+
+    const shown = entries.slice(0, GRAPH_LABEL_MAX_ENTRIES - 1);
+    shown.push({ text: `+${entries.length - shown.length} more (see text)`, color: GRAPH_COLORS.muted });
+    return shown;
+  }
+
+  function getBoxOverlap(a, b) {
+    const width = Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x);
+    const height = Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y);
+    return width > 0 && height > 0 ? width * height : 0;
+  }
+
+  // Liang-Barsky clip: true when the segment passes through the box at all.
+  function segmentHitsBox(x1, y1, x2, y2, box) {
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    let enter = 0;
+    let exit = 1;
+
+    for (const [p, q] of [
+      [-dx, x1 - box.x],
+      [dx, box.x + box.width - x1],
+      [-dy, y1 - box.y],
+      [dy, box.y + box.height - y1],
+    ]) {
+      if (p === 0) {
+        if (q < 0) return false;
+        continue;
+      }
+      const r = q / p;
+      if (p < 0) {
+        if (r > exit) return false;
+        enter = Math.max(enter, r);
+      } else {
+        if (r < enter) return false;
+        exit = Math.min(exit, r);
+      }
+    }
+
+    return true;
+  }
+
+  // A label sitting on a crossing reads as belonging to either line, so another
+  // line through a label costs about as much as a modest box overlap.
+  const GRAPH_FOREIGN_EDGE_PENALTY = 2000;
+
+  // Works in unscaled, centre-origin coordinates; drawReportGraph shifts
+  // everything into the canvas once the bounds are known.
+  function layoutReportGraph(ctx, graph) {
+    const count = graph.nodes.length;
+    const radius = Math.max(190, count * 65);
+    const nodeBoxes = graph.nodes.map((node, index) => {
+      // The source sits at the top and the rest go clockwise around it.
+      const angle = -Math.PI / 2 + (index * 2 * Math.PI) / count;
+      const cx = Math.round(Math.cos(angle) * radius);
+      const cy = Math.round(Math.sin(angle) * radius * (count === 2 ? 0.75 : 1));
+      return {
+        cx,
+        cy,
+        x: cx - GRAPH_NODE_WIDTH / 2,
+        y: cy - GRAPH_NODE_HEIGHT / 2,
+        width: GRAPH_NODE_WIDTH,
+        height: GRAPH_NODE_HEIGHT,
+      };
+    });
+
+    ctx.font = GRAPH_FONT;
+    const placed = [];
+    const labels = graph.edges.map((edge, edgeIndex) => {
+      const lines = getGraphEdgeLines(edge).map(line => ({
+        ...line,
+        text: fitGraphText(ctx, line.text, GRAPH_LABEL_MAX_TEXT_WIDTH),
+      }));
+      const width = Math.ceil(Math.max(...lines.map(line => ctx.measureText(line.text).width))) + GRAPH_LABEL_PADDING * 2;
+      const height = lines.length * GRAPH_LINE_HEIGHT + GRAPH_LABEL_PADDING * 2;
+      const from = nodeBoxes[edge.from];
+      const to = nodeBoxes[edge.to];
+      const dx = to.cx - from.cx;
+      const dy = to.cy - from.cy;
+      const length = Math.hypot(dx, dy) || 1;
+      const nx = -dy / length;
+      const ny = dx / length;
+      const sideStep = (Math.abs(nx) * width + Math.abs(ny) * height) / 2 + 12;
+
+      // Try spots along the line first, then beside it, and keep whichever
+      // collides least with the boxes and labels already placed.
+      let best = null;
+      for (const side of [0, 1, -1, 2, -2]) {
+        for (const t of [0.5, 0.4, 0.6, 0.3, 0.7, 0.25, 0.75]) {
+          const anchorX = from.cx + dx * t;
+          const anchorY = from.cy + dy * t;
+          const box = {
+            x: Math.round(anchorX + nx * sideStep * side - width / 2),
+            y: Math.round(anchorY + ny * sideStep * side - height / 2),
+            width,
+            height,
+          };
+          const foreignEdges = graph.edges.filter((other, otherIndex) => {
+            if (otherIndex === edgeIndex) return false;
+            const a = nodeBoxes[other.from];
+            const b = nodeBoxes[other.to];
+            return segmentHitsBox(a.cx, a.cy, b.cx, b.cy, box);
+          }).length;
+          const overlap = [...nodeBoxes, ...placed].reduce((sum, other) => sum + getBoxOverlap(box, other), 0)
+            + foreignEdges * GRAPH_FOREIGN_EDGE_PENALTY;
+          if (!best || overlap < best.overlap) {
+            best = { ...box, anchorX, anchorY, overlap, lines };
+          }
+          if (!overlap) break;
+        }
+        if (best && !best.overlap) break;
+      }
+
+      placed.push(best);
+      return best;
+    });
+
+    return { nodeBoxes, labels };
+  }
+
+  function drawReportGraph(graph) {
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    const { nodeBoxes, labels } = layoutReportGraph(ctx, graph);
+
+    ctx.font = GRAPH_FONT;
+    const legendLines = graph.nodes.map(node => {
+      const role = node.source ? ' (source)' : '';
+      const steam = node.steam64 && node.steam64 !== node.label ? ` (${node.steam64})` : '';
+      return `${node.label}${role}  ·  ${node.url}${steam}`;
+    });
+    const legendKey = [
+      { text: 'name = exact trace', color: GRAPH_COLORS.text },
+      { text: '~ a - b = similar trace', color: GRAPH_COLORS.similar },
+      { text: 'IP = shared IP', color: GRAPH_COLORS.ip },
+    ];
+    const legendKeyGap = 24;
+    const legendWidth = Math.max(
+      ...legendLines.map(line => ctx.measureText(line).width),
+      legendKey.reduce((sum, item) => sum + ctx.measureText(item.text).width + legendKeyGap, 0)
+    );
+
+    const boxes = [...nodeBoxes, ...labels];
+    const minX = Math.min(...boxes.map(box => box.x));
+    const maxX = Math.max(...boxes.map(box => box.x + box.width));
+    const minY = Math.min(...boxes.map(box => box.y));
+    const maxY = Math.max(...boxes.map(box => box.y + box.height));
+    const graphWidth = maxX - minX;
+    const width = Math.ceil(Math.max(graphWidth, legendWidth) + GRAPH_MARGIN * 2);
+    const legendTop = Math.ceil(maxY - minY + GRAPH_MARGIN * 2);
+    const height = legendTop + (legendLines.length + 2) * GRAPH_LINE_HEIGHT + GRAPH_MARGIN;
+    const offsetX = (width - graphWidth) / 2 - minX;
+    const offsetY = GRAPH_MARGIN - minY;
+
+    // Resizing resets the context, so every style is set after this point.
+    canvas.width = width * GRAPH_SCALE;
+    canvas.height = height * GRAPH_SCALE;
+    ctx.setTransform(GRAPH_SCALE, 0, 0, GRAPH_SCALE, 0, 0);
+    ctx.textBaseline = 'middle';
+
+    ctx.fillStyle = GRAPH_COLORS.background;
+    ctx.fillRect(0, 0, width, height);
+
+    ctx.strokeStyle = GRAPH_COLORS.edge;
+    ctx.lineWidth = 1.5;
+    graph.edges.forEach(edge => {
+      const from = nodeBoxes[edge.from];
+      const to = nodeBoxes[edge.to];
+      ctx.beginPath();
+      ctx.moveTo(from.cx + offsetX, from.cy + offsetY);
+      ctx.lineTo(to.cx + offsetX, to.cy + offsetY);
+      ctx.stroke();
+    });
+
+    // A label pushed off its line gets a dashed leader back to it.
+    ctx.setLineDash([3, 3]);
+    labels.forEach(label => {
+      const centerX = label.x + label.width / 2;
+      const centerY = label.y + label.height / 2;
+      if (Math.hypot(centerX - label.anchorX, centerY - label.anchorY) < 1) return;
+      ctx.beginPath();
+      ctx.moveTo(label.anchorX + offsetX, label.anchorY + offsetY);
+      ctx.lineTo(centerX + offsetX, centerY + offsetY);
+      ctx.stroke();
+    });
+    ctx.setLineDash([]);
+
+    ctx.font = GRAPH_FONT;
+    labels.forEach(label => {
+      const x = label.x + offsetX;
+      const y = label.y + offsetY;
+      traceGraphRoundRect(ctx, x, y, label.width, label.height, 5);
+      ctx.fillStyle = GRAPH_COLORS.labelFill;
+      ctx.fill();
+      ctx.strokeStyle = GRAPH_COLORS.labelBorder;
+      ctx.stroke();
+
+      label.lines.forEach((line, index) => {
+        ctx.fillStyle = line.color;
+        ctx.fillText(line.text, x + GRAPH_LABEL_PADDING, y + GRAPH_LABEL_PADDING + GRAPH_LINE_HEIGHT * (index + 0.5));
+      });
+    });
+
+    graph.nodes.forEach((node, index) => {
+      const box = nodeBoxes[index];
+      const x = box.x + offsetX;
+      const y = box.y + offsetY;
+      traceGraphRoundRect(ctx, x, y, box.width, box.height, 7);
+      ctx.fillStyle = GRAPH_COLORS.nodeFill;
+      ctx.fill();
+      ctx.lineWidth = node.source ? 2 : 1.5;
+      ctx.strokeStyle = node.source ? GRAPH_COLORS.sourceBorder : GRAPH_COLORS.nodeBorder;
+      ctx.stroke();
+
+      ctx.textAlign = 'center';
+      // The source always sits at the top, so its tag has the space above it.
+      if (node.source) {
+        ctx.font = GRAPH_FONT;
+        ctx.fillStyle = GRAPH_COLORS.sourceBorder;
+        ctx.fillText('Source', x + box.width / 2, y - 9);
+      }
+      ctx.font = GRAPH_NODE_FONT;
+      ctx.fillStyle = GRAPH_COLORS.text;
+      ctx.fillText(fitGraphText(ctx, node.label, box.width - 12), x + box.width / 2, y + 14);
+      // Steam64 stays under the name even when it is also the label, since alts
+      // often share a name and this is what tells two of them apart.
+      ctx.font = GRAPH_FONT;
+      ctx.fillStyle = GRAPH_COLORS.muted;
+      const detail = [node.steam64, getCfIdFromUrl(node.url)].find(value => value && value !== node.label) || '';
+      ctx.fillText(fitGraphText(ctx, detail, box.width - 12), x + box.width / 2, y + 31);
+      ctx.textAlign = 'left';
+    });
+    ctx.lineWidth = 1.5;
+
+    // Without this, a diagram with no lines reads as a broken image rather than
+    // as an answer. The middle of the ring is always empty when nothing is drawn.
+    if (!graph.edges.length) {
+      ctx.textAlign = 'center';
+      ctx.font = GRAPH_NODE_FONT;
+      ctx.fillStyle = GRAPH_COLORS.muted;
+      ctx.fillText('No shared traces or IPs found', offsetX, offsetY);
+      ctx.textAlign = 'left';
+    }
+
+    // The legend makes the pasted image readable on its own, away from the text.
+    ctx.font = GRAPH_FONT;
+    let legendY = legendTop + GRAPH_LINE_HEIGHT / 2;
+    ctx.fillStyle = GRAPH_COLORS.muted;
+    legendLines.forEach(line => {
+      ctx.fillText(line, GRAPH_MARGIN, legendY);
+      legendY += GRAPH_LINE_HEIGHT;
+    });
+    legendY += GRAPH_LINE_HEIGHT;
+    let keyX = GRAPH_MARGIN;
+    legendKey.forEach(item => {
+      ctx.fillStyle = item.color;
+      ctx.fillText(item.text, keyX, legendY);
+      keyX += ctx.measureText(item.text).width + legendKeyGap;
+    });
+
+    canvas.style.cssText = `
+      display: block; width: ${width}px; max-width: 100%; height: auto;
+      margin-top: 8px; border: 1px solid #2c313a; border-radius: 6px;
+    `;
+    return canvas;
+  }
+
+  // GM_setClipboard only takes text in practice, so images go through the
+  // async clipboard API directly.
+  async function copyCanvasImage(canvas) {
+    if (typeof ClipboardItem !== 'function' || !navigator.clipboard?.write) return false;
+
+    try {
+      // Handing ClipboardItem a promise keeps the click's user activation alive
+      // while the PNG encodes.
+      const blob = new Promise((resolve, reject) => {
+        canvas.toBlob(result => (result ? resolve(result) : reject(new Error('PNG encode failed'))), 'image/png');
+      });
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+      return true;
+    } catch (err) {
+      console.warn('Could not copy report image:', err);
+      return false;
+    }
+  }
+
+  function showReportModal(report, title = 'Report', graph = null) {
     // A second report replaces the first rather than stacking on top of it.
     document.getElementById('codex-report-modal')?.remove();
 
@@ -2514,7 +2859,7 @@
     const panel = document.createElement('div');
     panel.style.cssText = `
       ${DIALOG_PANEL_CSS}
-      width: min(760px, calc(100vw - 40px));
+      width: min(${graph?.nodes?.length > 2 ? 960 : 760}px, calc(100vw - 40px));
     `;
 
     const heading = document.createElement('div');
@@ -2530,6 +2875,10 @@
     `;
     appendLinkifiedText(body, report);
 
+    // A diagram of just two accounts says nothing the text does not, so it is
+    // only drawn once there are three or more.
+    const graphCanvas = graph?.nodes?.length > 2 ? drawReportGraph(graph) : null;
+
     function close() {
       document.removeEventListener('keydown', onDocumentKeydown, true);
       overlay.remove();
@@ -2541,10 +2890,19 @@
       close();
     }
 
-    const copyButton = createDialogButton('Copy', DIALOG_NEUTRAL_BG, DIALOG_NEUTRAL_HOVER);
+    // Copy only ever takes the text, so it says so when Copy Image sits beside it.
+    const copyButton = createDialogButton(graphCanvas ? 'Copy Text' : 'Copy', DIALOG_NEUTRAL_BG, DIALOG_NEUTRAL_HOVER);
     copyButton.addEventListener('click', async () => {
       const copied = await copyText(report);
       toast(copied ? 'Report copied to clipboard.' : 'Could not copy the report.');
+    });
+
+    const copyImageButton = graphCanvas
+      ? createDialogButton('Copy Image', DIALOG_NEUTRAL_BG, DIALOG_NEUTRAL_HOVER)
+      : null;
+    copyImageButton?.addEventListener('click', async () => {
+      const copied = await copyCanvasImage(graphCanvas);
+      toast(copied ? 'Diagram copied to clipboard.' : 'Could not copy the diagram. Right-click it to copy or save instead.');
     });
 
     const spacer = document.createElement('div');
@@ -2555,9 +2913,9 @@
 
     const actions = document.createElement('div');
     actions.style.cssText = DIALOG_ACTIONS_CSS;
-    actions.append(copyButton, spacer, closeButton);
+    actions.append(...[copyButton, copyImageButton, spacer, closeButton].filter(Boolean));
 
-    panel.append(heading, body, actions);
+    panel.append(...[heading, graphCanvas, body, actions].filter(Boolean));
     overlay.appendChild(panel);
     overlay.addEventListener('mousedown', event => {
       if (event.target === overlay) close();
@@ -2739,10 +3097,98 @@
     });
   }
 
+  // Compares every target with every other target. The source side is already
+  // covered by each result's own shared fields, so only target pairs are built
+  // here, and pairs with nothing in common are dropped.
+  function buildTargetPairMatches(results) {
+    const pairs = [];
+
+    for (let i = 0; i < results.length; i += 1) {
+      for (let j = i + 1; j < results.length; j += 1) {
+        const first = results[i];
+        const second = results[j];
+        const matches = buildSharedMatchData(
+          first.traces || [],
+          second.traces || [],
+          first.ips || [],
+          second.ips || []
+        );
+
+        if (!matches.sharedTraces.length && !matches.similarMatches.length && !matches.sharedIps.length) {
+          continue;
+        }
+
+        pairs.push({ first, second, ...matches });
+      }
+    }
+
+    return pairs;
+  }
+
+  // Plain data for the report diagram. It is saved with the report, because the
+  // report is often shown only after navigating back to the source profile.
+  // Node 0 is the source; edges are only made for pairs that share something.
+  // Boxes are labelled with the CFTools profile name, falling back to Steam64 and
+  // then the profile id when the name could not be read.
+  function buildCompareGraph(sourceProfile, sourceSteam64, results, pairs) {
+    const toNode = (url, name, steam64, source) => ({
+      label: name || steam64 || getCfIdFromUrl(url) || '?',
+      url,
+      steam64,
+      source,
+    });
+    const nodes = [
+      toNode(sourceProfile?.url || '', sourceProfile?.name || '', sourceSteam64 || '', true),
+      ...results.map(result => toNode(result.url || '', result.name || '', result.steam64 || '', false)),
+    ];
+    const toEdge = (from, to, matches) => ({
+      from,
+      to,
+      exact: matches.sharedTraces || [],
+      similar: matches.similarMatches || [],
+      ips: matches.sharedIps || [],
+    });
+    const edges = [];
+
+    results.forEach((result, index) => {
+      if (result.sharedTraces?.length || result.similarMatches?.length || result.sharedIps?.length) {
+        edges.push(toEdge(0, index + 1, result));
+      }
+    });
+    pairs.forEach(pair => {
+      edges.push(toEdge(results.indexOf(pair.first) + 1, results.indexOf(pair.second) + 1, pair));
+    });
+
+    return { nodes, edges };
+  }
+
+  function appendTargetPairSection(lines, pairs, heading) {
+    const accountLine = result => (result.steam64 ? `${result.url || ''} (${result.steam64})` : (result.url || ''));
+
+    lines.push('');
+    lines.push(heading);
+
+    if (!pairs.length) {
+      lines.push('None found');
+      return;
+    }
+
+    pairs.forEach((pair, index) => {
+      if (index > 0) lines.push('');
+      lines.push(`${accountLine(pair.first)} ↔ ${accountLine(pair.second)}`);
+      lines.push('Exact Traces:');
+      lines.push(...(pair.sharedTraces.length ? pair.sharedTraces : ['None found']));
+      lines.push('Similar Traces:');
+      lines.push(...(pair.similarMatches.length ? pair.similarMatches : ['None found']));
+      lines.push('Shared IPs:');
+      lines.push(...(pair.sharedIps.length ? pair.sharedIps : ['None found']));
+    });
+  }
+
   // The multi-target version of buildTraceCompareReport. Unlike the alt report it
   // keeps the targets that came back empty: these URLs were asked for by hand, so
   // "nothing shared" is an answer the user wants to see rather than a row to hide.
-  function buildMultiCompareReport(sourceProfile, sourceSteam64, results) {
+  function buildMultiCompareReport(sourceProfile, sourceSteam64, results, pairs) {
     const sourceUrl = sourceProfile?.url || '';
     const lines = [
       'Source Account:',
@@ -2764,6 +3210,8 @@
       lines.push(...(result.sharedIps.length ? result.sharedIps : ['None found']));
     });
 
+    appendTargetPairSection(lines, pairs, 'Between Compared Profiles:');
+
     return lines.join('\n');
   }
 
@@ -2773,9 +3221,13 @@
   // Traces sets it when it hands several URLs to the same stages.
   async function finishMultiCompare(state, results) {
     const isExplicitCompare = state.reportMode === 'compare';
+    // Pairwise matching is the expensive part, so it runs once and feeds both
+    // the text report and the diagram.
+    const pairs = buildTargetPairMatches(results);
     const report = isExplicitCompare
-      ? buildMultiCompareReport(state.sourceProfile, state.sourceSteam64 || '', results)
-      : buildAltCompareReport(state.sourceProfile, state.sourceSteam64 || '', results);
+      ? buildMultiCompareReport(state.sourceProfile, state.sourceSteam64 || '', results, pairs)
+      : buildAltCompareReport(state.sourceProfile, state.sourceSteam64 || '', results, pairs);
+    const graph = buildCompareGraph(state.sourceProfile, state.sourceSteam64 || '', results, pairs);
     const successToast = isExplicitCompare
       ? 'Trace comparison copied to clipboard.'
       : 'Alt comparison copied to clipboard.';
@@ -2785,7 +3237,7 @@
     const returnUrl = state.sourceProfile?.url || '';
 
     if (returnUrl && returnUrl !== location.href) {
-      saveReportState(state.sourceProfile, report, successToast, failureToast);
+      saveReportState(state.sourceProfile, report, successToast, failureToast, graph);
       location.href = returnUrl;
       return;
     }
@@ -2795,7 +3247,7 @@
     const copied = await copyText(report);
     console.log(report);
     toast(copied ? successToast : failureToast);
-    showReportModal(report, isExplicitCompare ? 'Trace Comparison' : 'Alt Comparison');
+    showReportModal(report, isExplicitCompare ? 'Trace Comparison' : 'Alt Comparison', graph);
   }
 
   // Button shown on the Identities area for launching a trace compare job.
@@ -3152,10 +3604,15 @@
           ...(state.altResults || []),
           {
             url: currentAltUrl,
+            name: targetData.profile?.name || '',
             steam64: targetData.steam64 || '',
             sharedTraces: matches.sharedTraces,
             similarMatches: matches.similarMatches,
             sharedIps: matches.sharedIps,
+            // Kept so finishMultiCompare can compare the targets with each other,
+            // not only with the source.
+            traces: targetData.traces,
+            ips: targetData.ips,
           },
         ];
         const nextAltIndex = currentAltIndex + 1;
@@ -3217,7 +3674,7 @@
         const copied = await copyText(report);
         console.log(report);
         toast(copied ? (state.successToast || 'Trace comparison copied to clipboard.') : (state.failureToast || 'Trace comparison ready. Copy failed.'));
-        showReportModal(report, 'Trace Comparison');
+        showReportModal(report, 'Trace Comparison', state.graph);
       }
     } catch (err) {
       console.error('Trace comparison failed:', err);
