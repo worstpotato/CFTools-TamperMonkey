@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CFTools Tools: Helper Script
 // @namespace    austin.cftools.vpp
-// @version      5.25.0
+// @version      5.26.0
 // @description  Adds coordinate copy tools, Discord ban entry creation, profile trace comparison helpers, and server-log shortcuts for CFTools
 // @match        https://*cftools*/*
 // @match        https://*.cftools.cloud/*
@@ -30,6 +30,10 @@
   const CHEATER_SCAN_BUTTON_STORAGE_KEY = 'codex-cheater-scan-button';
   // Not a toggle: the server picker's last selection, as a JSON list of ids.
   const CHEATER_SCAN_SERVERS_STORAGE_KEY = 'codex-cheater-scan-servers';
+  // Not a toggle either: the last scan mode picked, 'light', 'deep' or 'extreme'.
+  const CHEATER_SCAN_MODE_STORAGE_KEY = 'codex-cheater-scan-mode';
+  // Not a toggle: hashed ids of players recently scanned clean. See the scan cache.
+  const CHEATER_SCAN_CACHE_STORAGE_KEY = 'codex-cheater-scan-cache';
   const DEBUG_MODE_STORAGE_KEY = 'codex-debug-mode';
 
   /*************** Toast ***************/
@@ -204,6 +208,10 @@
   function isCheaterScanButtonEnabled() {
     return cheaterScanButtonToggle.isEnabled();
   }
+
+  // A plain action rather than a setting. It shares the toggles' list so that it
+  // keeps its place in the menu when they are re-registered.
+  menuToggles.push({ commandId: null, caption: () => 'Clear scan cache', flip: () => clearScanCache() });
 
   // Verbose console logging for when CFTools changes its markup and a button
   // stops appearing.
@@ -2449,6 +2457,12 @@
   const DIALOG_CONFIRM_BG = '#1f6f4a';
   const DIALOG_CONFIRM_HOVER = '#27885b';
 
+  // Enter on a focused button belongs to that button. A dialog's Enter-to-submit
+  // shortcut stepping in there turned a keyboard press on Cancel into Scan.
+  function isButtonKeyTarget(event) {
+    return event.target?.tagName === 'BUTTON';
+  }
+
   function createDialogButton(label, background, hover) {
     const button = document.createElement('button');
     button.type = 'button';
@@ -2503,9 +2517,13 @@
     }
   }
 
+  // The open report's close(), so a replacement takes the old one's Escape
+  // listener down with it. Removing only the overlay left the listener behind.
+  let closeOpenReportModal = null;
+
   function showReportModal(report, title = 'Report') {
     // A second report replaces the first rather than stacking on top of it.
-    document.getElementById('codex-report-modal')?.remove();
+    closeOpenReportModal?.();
 
     const overlay = document.createElement('div');
     overlay.id = 'codex-report-modal';
@@ -2533,6 +2551,7 @@
     function close() {
       document.removeEventListener('keydown', onDocumentKeydown, true);
       overlay.remove();
+      if (closeOpenReportModal === close) closeOpenReportModal = null;
     }
 
     function onDocumentKeydown(event) {
@@ -2565,6 +2584,7 @@
 
     document.addEventListener('keydown', onDocumentKeydown, true);
     document.body.appendChild(overlay);
+    closeOpenReportModal = close;
     closeButton.focus();
   }
 
@@ -2618,7 +2638,16 @@
         const inputs = Array.from(rows.querySelectorAll('input'));
         const urls = [];
         const seen = new Set();
+        const sourceCfid = (getCfId() || '').toLowerCase();
         let firstInvalid = null;
+        let invalidMessage = '';
+
+        const markInvalid = (input, message) => {
+          input.style.borderColor = '#ff7676';
+          if (firstInvalid) return;
+          firstInvalid = input;
+          invalidMessage = message;
+        };
 
         for (const input of inputs) {
           const raw = input.value.trim();
@@ -2626,19 +2655,27 @@
 
           const normalized = normalizeCompareTargetUrl(raw);
           if (!normalized) {
-            input.style.borderColor = '#ff7676';
-            if (!firstInvalid) firstInvalid = input;
+            markInvalid(input, 'That is not a CFTools profile URL.');
+            continue;
+          }
+
+          // Matched by id rather than by URL: /profile/X and /profile/X/overview
+          // are the same profile. Comparing against the source itself would report
+          // every one of its traces as shared.
+          const cfid = (getCfIdFromUrl(normalized) || '').toLowerCase();
+          if (sourceCfid && cfid === sourceCfid) {
+            markInvalid(input, 'That is the profile you are comparing from.');
             continue;
           }
 
           // The same profile twice is one visit's worth of work for no extra answer.
-          if (seen.has(normalized)) continue;
-          seen.add(normalized);
+          if (seen.has(cfid)) continue;
+          seen.add(cfid);
           urls.push(normalized);
         }
 
         if (firstInvalid) {
-          error.textContent = 'That is not a CFTools profile URL.';
+          error.textContent = invalidMessage;
           firstInvalid.focus();
           return;
         }
@@ -3232,6 +3269,9 @@
   // Walks the dashboard's player list, opens every player wearing a public-ban
   // badge, and reports back the ones whose ban reasons name them a cheater.
   //
+  // A deep scan does the same, and also opens every confirmed alt of those players
+  // to check it for a BattlEye ban or a ban on one of ALT_SCAN_BAN_LISTS.
+  //
   // Like the trace compare, this drives the page rather than calling an API: the
   // bans only exist in the DOM once a profile's Bans tab has rendered, so the job
   // navigates the tab and picks itself back up out of sessionStorage after every
@@ -3250,6 +3290,23 @@
   // The dashboard renders this badge as "2 public bans"; the profile sidebar uses
   // "2 public ban(s)". Matching the singular covers both.
   const PUBLIC_BAN_BADGE_RE = /public ban/i;
+  // Deep scan: any ban on one of these lists flags an alt, whatever its reason.
+  // Matched case-insensitively against the whole list name. Every list here has
+  // to be a public one: an alt without a public-ban badge has its Bans tab
+  // skipped, and a ban on a private list would go unseen.
+  const ALT_SCAN_BAN_LISTS = ['Companions-Banlist', 'KarmaKrew_Cheaters'];
+  // Only the green badge counts. The other links in the alt row are CFTools'
+  // unconfirmed guesses.
+  const CONFIRMED_ALT_BADGE_RE = /confirmed alternate/i;
+  const BATTLEYE_BAD_STANDING_RE = /bad standing/i;
+  const BATTLEYE_GOOD_STANDING_RE = /good standing/i;
+  // How long the alt row has to hold still before it is read.
+  const ALT_LIST_SETTLE_MS = 800;
+  // The modes that also open confirmed alts.
+  const ALT_SCAN_MODES = ['deep', 'extreme'];
+  // The Bans tab's empty state, and how long it has to stand before it is believed.
+  const NO_BAN_ENTRIES_RE = /^no ban entries$/i;
+  const NO_BAN_ENTRIES_CONFIRM_MS = 500;
   let cheaterScanRunning = false;
 
   function loadCheaterScanState() {
@@ -3350,14 +3407,12 @@
 
   // Deduplicated by CFTools id: a player who reconnects during the scan can show up
   // in the list twice, and visiting the same profile twice only pads the report.
-  function getBannedDashboardPlayers() {
+  // `badge` is empty for a player without a public ban.
+  function getDashboardPlayers() {
     const players = [];
     const seen = new Set();
 
     for (const card of getDashboardPlayerCards()) {
-      const badge = getPublicBanBadge(card);
-      if (!badge) continue;
-
       const url = getDashboardPlayerProfileUrl(card);
       const cfid = getCfIdFromUrl(url);
       if (!url || !cfid || seen.has(cfid)) continue;
@@ -3367,11 +3422,18 @@
         cfid,
         url,
         name: getDashboardPlayerName(card) || cfid,
-        badge: getCleanText(badge),
+        badge: getCleanText(getPublicBanBadge(card)),
       });
     }
 
     return players;
+  }
+
+  // An extreme scan opens everyone, since a player with a clean record can still
+  // have a banned alt. The other modes only open players carrying a public ban.
+  function getScanDashboardPlayers(scanMode) {
+    const players = getDashboardPlayers();
+    return scanMode === 'extreme' ? players : players.filter(player => player.badge);
   }
 
   // The sidebar's Bans entry carries a count badge ("Bans 2 public ban(s)"), so the
@@ -3382,6 +3444,15 @@
       if (/^bans$/i.test(getOwnText(link))) return link;
     }
     return null;
+  }
+
+  // The "N public ban(s)" badge on the sidebar's Bans entry.
+  function hasProfilePublicBanBadge() {
+    const link = findBansProfileLink();
+    if (!link) return false;
+
+    return Array.from(link.querySelectorAll('.badge'))
+      .some(badge => PUBLIC_BAN_BADGE_RE.test(getCleanText(badge)));
   }
 
   // The Bans view renders a plain bootstrap-vue table. Matching on its header text
@@ -3450,11 +3521,46 @@
     return CHEATER_BAN_KEYWORDS.some(keyword => reason.includes(keyword));
   }
 
+  function isAltScanBan(ban) {
+    const banList = (ban?.banList || '').toLowerCase();
+    return ALT_SCAN_BAN_LISTS.some(name => name.toLowerCase() === banList);
+  }
+
+  function hasNoBanEntriesNotice() {
+    for (const heading of document.querySelectorAll('#banEntries h5')) {
+      if (NO_BAN_ENTRIES_RE.test(getCleanText(heading))) return true;
+    }
+    return false;
+  }
+
+  // Resolves with the ban table, or null once "No ban entries" has held for
+  // NO_BAN_ENTRIES_CONFIRM_MS. The notice could show while the bans are still on
+  // their way, so it only counts once it has stood for a moment with no table
+  // turning up; trusting it on sight would risk missing a ban.
+  async function waitForBanTableOrEmpty(timeoutMs) {
+    const started = Date.now();
+    let emptySince = 0;
+
+    while (Date.now() - started < timeoutMs) {
+      const table = findBanTable();
+      if (table) return table;
+
+      if (!hasNoBanEntriesNotice()) {
+        emptySince = 0;
+      } else if (!emptySince) {
+        emptySince = Date.now();
+      } else if (Date.now() - emptySince >= NO_BAN_ENTRIES_CONFIRM_MS) {
+        return null;
+      }
+
+      await delay(100);
+    }
+
+    throw new Error('Timed out waiting for the ban list.');
+  }
+
   // Opens the profile's Bans tab and reads the table out of it.
   async function collectProfileBans(label) {
-    toast(`Checking ${label}...`, 2500);
-    await waitForPageReady();
-
     const bansLink = await waitForElement(() => findBansProfileLink(), 15000, 100);
     if (!bansLink.classList.contains('profile-link-active')) {
       clickElement(bansLink);
@@ -3465,44 +3571,285 @@
       );
     }
 
-    // A missing table is a result, not a failure: the badge counts can lag, and a
-    // profile can end up on the Bans tab with nothing to show. The shorter wait
-    // keeps that case from costing the full element timeout on every player.
-    try {
-      await waitForElement(() => findBanTable(), 8000, 100);
-    } catch {
-      debugLog('[CFTools Tools] Cheater scan: no ban table rendered for', label);
+    // An empty tab is a result, not a failure: the badge counts can lag, and a
+    // profile can end up on the Bans tab with nothing to show. CFTools says so
+    // with a "No ban entries" notice, which ends the wait early. A tab that renders
+    // neither that nor a table within the timeout did not load, and that is thrown
+    // so the caller marks the read incomplete rather than taking it as clean.
+    const table = await waitForBanTableOrEmpty(8000);
+
+    if (!table) {
+      debugLog('[CFTools Tools] Cheater scan: no ban entries for', label);
       return [];
     }
 
     return readBansFromPage();
   }
 
+  async function openProfileOverview() {
+    const overviewLink = await waitForElement(() => findProfileLink('Overview'), 15000, 100);
+    if (overviewLink.classList.contains('profile-link-active')) return;
+
+    clickElement(overviewLink);
+    await waitForElement(
+      () => findProfileLink('Overview')?.classList.contains('profile-link-active') || null,
+      10000,
+      100
+    );
+  }
+
+  // Each alt is an <li> holding its profile link, with the "Confirmed alternate"
+  // badge sat beside the link when CFTools has confirmed it.
+  function getConfirmedAltProfiles() {
+    const altRow = getPotentialAltRow();
+    if (!altRow) return [];
+
+    const currentCfid = getCfId();
+    const alts = new Map();
+
+    for (const item of altRow.querySelectorAll('li')) {
+      const confirmed = Array.from(item.querySelectorAll('.badge'))
+        .some(badge => CONFIRMED_ALT_BADGE_RE.test(getCleanText(badge)));
+      if (!confirmed) continue;
+
+      const url = getDashboardPlayerProfileUrl(item);
+      const cfid = getCfIdFromUrl(url);
+      if (!url || !cfid || cfid === currentCfid || alts.has(cfid)) continue;
+
+      alts.set(cfid, { cfid, url });
+    }
+
+    return Array.from(alts.values());
+  }
+
+  // The alt row paints in stages (see ensureAltCompareButton), so it is only read
+  // once its links and badges have stopped changing. Resolves with null if the
+  // row never renders: the row is there even for a profile with no alts, so
+  // missing it means the read did not finish.
+  async function collectConfirmedAlts(label) {
+    await openProfileOverview();
+
+    try {
+      await waitForElement(() => getPotentialAltRow(), 8000, 100);
+    } catch {
+      debugLog('[CFTools Tools] Ban scan: no alt row rendered for', label);
+      return null;
+    }
+
+    const started = Date.now();
+    let lastSize = -1;
+    let stableSince = Date.now();
+
+    while (Date.now() - started < 8000) {
+      const size = getPotentialAltRow()?.querySelectorAll('a[href*="/profile/"], .badge').length ?? 0;
+
+      if (size !== lastSize) {
+        lastSize = size;
+        stableSince = Date.now();
+      } else if (Date.now() - stableSince > ALT_LIST_SETTLE_MS) {
+        break;
+      }
+
+      await delay(100);
+    }
+
+    return getConfirmedAltProfiles();
+  }
+
+  // 'bad', 'good', or '' while the BattlEye card has yet to say.
+  function readBattlEyeStanding() {
+    const card = document.querySelector('img[alt="battleye logo" i]')?.closest('.card-body');
+    if (!card) return '';
+
+    const text = getCleanText(card);
+    if (BATTLEYE_BAD_STANDING_RE.test(text)) return 'bad';
+    if (BATTLEYE_GOOD_STANDING_RE.test(text) || card.querySelector('.fa-shield-alt.text-success')) return 'good';
+    return '';
+  }
+
+  // A card that never says either way is recorded as unknown, which does not flag
+  // the alt.
+  async function waitForBattlEyeStanding(label) {
+    try {
+      return await waitForElement(() => readBattlEyeStanding(), 8000, 100);
+    } catch {
+      debugLog('[CFTools Tools] Ban scan: no BattlEye standing rendered for', label);
+      return '';
+    }
+  }
+
+  // Splices a main's confirmed alts in straight after it. An alt shared by several
+  // mains is visited once: one already checked or already queued stays put, and
+  // the report finds it again through altLinks.
+  function queueAltProfiles(queue, index, alts, altChecks) {
+    const queued = new Set(queue.filter(entry => entry.kind === 'alt').map(entry => entry.cfid));
+    const fresh = alts
+      .filter(alt => !altChecks[alt.cfid] && !queued.has(alt.cfid))
+      .map(alt => ({ kind: 'alt', cfid: alt.cfid, url: alt.url }));
+    if (!fresh.length) return queue;
+
+    return [...queue.slice(0, index + 1), ...fresh, ...queue.slice(index + 1)];
+  }
+
+  // A profile that will not load is one skipped player, not a dead scan, so the
+  // failure goes to the console and the queue moves on. The alt lookup is kept
+  // apart from the ban read so that losing one does not cost the other. Either
+  // failing marks the player incomplete, which keeps them out of the scan cache.
+  async function scanMainProfile(state, index) {
+    const queue = state.profileQueue || [];
+    const player = queue[index];
+    const label = `${player.name} (${index + 1}/${queue.length})`;
+    const banMatches = { ...(state.banMatches || {}) };
+    const nextState = { ...state, banMatches };
+    const markIncomplete = () => {
+      nextState.incompleteCfids = { ...(nextState.incompleteCfids || {}), [player.cfid]: true };
+    };
+
+    try {
+      toast(`Checking ${label}...`, 2500);
+      await waitForPageReady();
+
+      // Overview first: it is the tab a profile opens on, and Bans replaces it.
+      if (ALT_SCAN_MODES.includes(state.scanMode)) {
+        let alts = null;
+        try {
+          alts = await collectConfirmedAlts(label);
+        } catch (err) {
+          console.error(`Ban scan could not read the alts of ${player.url}:`, err);
+        }
+        if (!alts) {
+          markIncomplete();
+          alts = [];
+        }
+
+        nextState.altLinks = { ...(state.altLinks || {}), [player.cfid]: alts.map(alt => alt.cfid) };
+        nextState.profileQueue = queueAltProfiles(queue, index, alts, state.altChecks || {});
+      }
+
+      // An extreme scan opens players with no public ban too. Their Bans tab has
+      // nothing to find, and waiting out its missing table costs seconds a player.
+      if (player.badge) {
+        const bans = await collectProfileBans(label);
+        banMatches[player.cfid] = bans.filter(isCheaterBan);
+      } else {
+        banMatches[player.cfid] = [];
+      }
+    } catch (err) {
+      console.error(`Ban scan could not read ${player.url}:`, err);
+      banMatches[player.cfid] = [];
+      markIncomplete();
+    }
+
+    return nextState;
+  }
+
+  // Whatever was read before a failure is kept: a BattlEye ban still counts if the
+  // Bans tab then refuses to load. The check is marked incomplete all the same,
+  // which keeps the alt's mains out of the scan cache.
+  async function scanAltProfile(state, index) {
+    const queue = state.profileQueue || [];
+    const alt = queue[index];
+    const label = `alt ${alt.cfid} (${index + 1}/${queue.length})`;
+    const check = { url: alt.url, name: '', battlEye: '', bans: [], incomplete: false };
+
+    try {
+      toast(`Checking ${label}...`, 2500);
+      await waitForPageReady();
+      await openProfileOverview();
+      check.name = getProfileName();
+      check.battlEye = await waitForBattlEyeStanding(label);
+
+      // Every ALT_SCAN_BAN_LISTS ban counts toward the sidebar's public-ban badge,
+      // so an alt without one has nothing on them to find. The badge only shows
+      // on Overview, and is only trusted once the BattlEye card has loaded, since
+      // both arrive with the profile's data, and once the sidebar's Bans entry it
+      // sits on is there to read. Short of either, the Bans tab is opened anyway.
+      if (check.battlEye && findBansProfileLink() && !hasProfilePublicBanBadge()) {
+        debugLog('[CFTools Tools] Ban scan: no public bans, skipping the Bans tab for', label);
+      } else {
+        const bans = await collectProfileBans(label);
+        check.bans = bans.filter(isAltScanBan);
+      }
+    } catch (err) {
+      console.error(`Ban scan could not read alt ${alt.url}:`, err);
+      check.incomplete = true;
+    }
+
+    return { ...state, altChecks: { ...(state.altChecks || {}), [alt.cfid]: check } };
+  }
+
+  function formatScanBanLine(ban, indent = '') {
+    const suffix = ban.issued ? ` (issued ${ban.issued})` : '';
+    return `${indent}- [${ban.banList || 'Unknown ban list'}] ${ban.reason || 'No reason given'}${suffix}`;
+  }
+
+  // The confirmed alts of a player that turned something up.
+  function getFlaggedAlts(state, cfid) {
+    const altChecks = state.altChecks || {};
+
+    return ((state.altLinks || {})[cfid] || [])
+      .map(altCfid => ({ cfid: altCfid, ...altChecks[altCfid] }))
+      .filter(alt => alt.battlEye === 'bad' || alt.bans?.length);
+  }
+
+  function getCheaterBanMatches(state, cfid) {
+    return (state.banMatches || {})[cfid] || [];
+  }
+
+  function isFlaggedScanPlayer(state, cfid) {
+    return getCheaterBanMatches(state, cfid).length > 0 || getFlaggedAlts(state, cfid).length > 0;
+  }
+
+  function appendScanPlayerLines(lines, state, player) {
+    lines.push(`${player.name} - ${player.url}`);
+    getCheaterBanMatches(state, player.cfid).forEach(ban => lines.push(formatScanBanLine(ban)));
+
+    getFlaggedAlts(state, player.cfid).forEach(alt => {
+      lines.push(`- Confirmed alt ${alt.name || alt.cfid} - ${alt.url}`);
+      if (alt.battlEye === 'bad') lines.push('  - BattlEye: Bad standing');
+      alt.bans.forEach(ban => lines.push(formatScanBanLine(ban, '  ')));
+    });
+  }
+
+  // Light scan keeps the report's original plain title.
+  const CHEATER_SCAN_MODE_TITLES = { deep: 'Deep', extreme: 'Extreme' };
+
+  // The queue holds each player once whichever servers they were on, so it is what
+  // the totals are counted off.
+  function buildScanReportHeader(state) {
+    const players = (state.profileQueue || []).filter(entry => entry.kind !== 'alt');
+    const banned = players.filter(player => getCheaterBanMatches(state, player.cfid).length);
+    const modeLabel = CHEATER_SCAN_MODE_TITLES[state.scanMode];
+    const lines = [
+      modeLabel ? `Cheater Ban Scan (${modeLabel})` : 'Cheater Ban Scan',
+      `Players with a ${CHEATER_BAN_KEYWORDS.join(' / ')} ban: ${banned.length}`,
+    ];
+
+    if (ALT_SCAN_MODES.includes(state.scanMode)) {
+      const altFlagged = players.filter(player => getFlaggedAlts(state, player.cfid).length);
+      lines.push(`Players with a flagged confirmed alt: ${altFlagged.length}`);
+    }
+
+    if (state.skippedCount > 0) {
+      lines.push(`Skipped (scanned in the last 24h): ${state.skippedCount}`);
+    }
+
+    return lines;
+  }
+
   function buildCheaterScanReport(state) {
     if (state.mode === 'multi') return buildMultiServerCheaterScanReport(state);
 
-    const results = state.results || [];
-    const flagged = results.filter(result => result.matches?.length);
-    const keywords = CHEATER_BAN_KEYWORDS.join(' / ');
-
-    const lines = [
-      'Cheater Ban Scan',
-      `Players with a ${keywords} ban: ${flagged.length}`,
-      '',
-      'Flagged Players:',
-    ];
+    const flagged = (state.profileQueue || [])
+      .filter(entry => entry.kind !== 'alt' && isFlaggedScanPlayer(state, entry.cfid));
+    const lines = [...buildScanReportHeader(state), '', 'Flagged Players:'];
 
     if (!flagged.length) {
       lines.push('None found');
     } else {
-      flagged.forEach((result, index) => {
+      flagged.forEach((player, index) => {
         if (index > 0) lines.push('');
-        lines.push(`${result.name} - ${result.url}`);
-
-        result.matches.forEach(ban => {
-          const suffix = ban.issued ? ` (issued ${ban.issued})` : '';
-          lines.push(`- [${ban.banList || 'Unknown ban list'}] ${ban.reason || 'No reason given'}${suffix}`);
-        });
+        appendScanPlayerLines(lines, state, player);
       });
     }
 
@@ -3536,10 +3883,14 @@
     await showCheaterScanReport(report);
   }
 
-  // Three-stage workflow:
-  // 1. Queue up every dashboard player carrying a public ban.
-  // 2. Visit each of their profiles in turn, reading the Bans tab on each.
-  // 3. Navigate back to the dashboard and show the report there.
+  // Workflow:
+  // 1. Queue up every dashboard player carrying a public ban (every player at
+  //    all, on an extreme scan). A sweep does this
+  //    in the server-collect stage, one dashboard per hop; the player-list button
+  //    reads the list it is sat on and starts at stage 2.
+  // 2. Visit each of their profiles in turn, reading the Bans tab on each. A deep
+  //    scan queues each player's confirmed alts in behind them as it goes.
+  // 3. Navigate back to where the scan started and show the report there.
   async function resumeCheaterScanWorkflow() {
     if (cheaterScanRunning) return;
 
@@ -3553,56 +3904,6 @@
     cheaterScanRunning = true;
 
     try {
-      if (state.stage === 'collect') {
-        const queue = state.queue || [];
-        const index = state.index || 0;
-        const player = queue[index];
-
-        if (!player) {
-          await finishCheaterScan(state);
-          return;
-        }
-
-        // Resumed somewhere other than the profile we were sent to, most likely
-        // because the user navigated away mid-scan. Leave the state alone so the
-        // job picks up again if they come back, and let the TTL clear it if not.
-        const currentCfid = getCfId();
-        if (!currentCfid || currentCfid !== player.cfid) return;
-
-        const results = [...(state.results || [])];
-
-        // A profile that will not load is one skipped player, not a dead scan, so the
-        // failure goes to the console and the queue moves on.
-        try {
-          const bans = await collectProfileBans(`${player.name} (${index + 1}/${queue.length})`);
-          results.push({
-            name: player.name,
-            url: player.url,
-            matches: bans.filter(isCheaterBan),
-          });
-        } catch (err) {
-          console.error(`Cheater scan could not read ${player.url}:`, err);
-        }
-
-        if (isCheaterScanCancelled()) return;
-
-        const nextState = { ...state, stage: 'collect', index: index + 1, results };
-        const nextPlayer = queue[index + 1];
-
-        if (!nextPlayer) {
-          await finishCheaterScan(nextState);
-          return;
-        }
-
-        if (!saveCheaterScanState(nextState)) {
-          clearCheaterScanState();
-          return;
-        }
-
-        location.href = nextPlayer.url;
-        return;
-      }
-
       if (state.stage === 'server-collect') {
         const servers = state.serverQueue || [];
         const serverIndex = state.serverIndex || 0;
@@ -3623,7 +3924,7 @@
         try {
           toast(`Reading ${server.name} (${serverIndex + 1}/${servers.length})...`, 2500);
           await waitForDashboardPlayerList();
-          players = getBannedDashboardPlayers();
+          players = getScanDashboardPlayers(state.scanMode);
         } catch (err) {
           console.error(`Ban scan could not read the player list for ${server.name}:`, err);
         }
@@ -3649,34 +3950,33 @@
       }
 
       if (state.stage === 'profile-collect') {
-        const queue = state.profileQueue || [];
         const index = state.profileIndex || 0;
-        const player = queue[index];
+        const entry = (state.profileQueue || [])[index];
 
-        if (!player) {
+        if (!entry) {
           await finishCheaterScan(state);
           return;
         }
 
+        // Resumed somewhere other than the profile we were sent to, most likely
+        // because the user navigated away mid-scan. Leave the state alone so the
+        // job picks up again if they come back, and let the TTL clear it if not.
         const currentCfid = getCfId();
-        if (!currentCfid || currentCfid !== player.cfid) return;
+        if (!currentCfid || currentCfid !== entry.cfid) return;
 
-        const banMatches = { ...(state.banMatches || {}) };
+        const scanned = entry.kind === 'alt'
+          ? await scanAltProfile(state, index)
+          : await scanMainProfile(state, index);
 
-        try {
-          const bans = await collectProfileBans(`${player.name} (${index + 1}/${queue.length})`);
-          banMatches[player.cfid] = bans.filter(isCheaterBan);
-        } catch (err) {
-          console.error(`Ban scan could not read ${player.url}:`, err);
-          banMatches[player.cfid] = [];
-        }
-
+        // Read off the scanned state: a deep scan may have just queued alts here.
+        // Players finished before a Stop are still worth caching, so the cache is
+        // written first and the cancel check comes after it: checking before the
+        // awaited write let a Stop clicked during it be saved back over.
+        const nextState = await recordScannedPlayers({ ...scanned, profileIndex: index + 1 });
         if (isCheaterScanCancelled()) return;
+        const nextEntry = nextState.profileQueue[index + 1];
 
-        const nextState = { ...state, banMatches, profileIndex: index + 1 };
-        const nextPlayer = queue[index + 1];
-
-        if (!nextPlayer) {
+        if (!nextEntry) {
           await finishCheaterScan(nextState);
           return;
         }
@@ -3686,7 +3986,7 @@
           return;
         }
 
-        location.href = nextPlayer.url;
+        location.href = nextEntry.url;
         return;
       }
 
@@ -3707,6 +4007,342 @@
     }
   }
 
+  /*************** Cheater ban scan: skip cache ***************/
+  // Players who have been fully scanned are skipped by later scans for a day,
+  // flagged or not, so a report only names a player the first time they turn up.
+  // Nothing about them is kept: each entry is a truncated SHA-256 of the player's
+  // id and dashboard ban badge, with when it was cached and how deep the scan
+  // went. Having the badge in the hash means a new public ban changes it, so the
+  // player is scanned (and reported) again instead of skipped.
+  //
+  // Stored as { [hash]: [cachedAt, level] } in the script's Tampermonkey storage,
+  // so it survives a restart and is shared by every CFTools tab.
+  const CHEATER_SCAN_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+  const CHEATER_SCAN_CACHE_HASH_LENGTH = 16;
+  // A light scan never looks at alts, so its entries cannot excuse a player from a
+  // scan that does.
+  const CHEATER_SCAN_CACHE_LEVEL_LIGHT = 1;
+  const CHEATER_SCAN_CACHE_LEVEL_ALTS = 2;
+
+  function canUseScanCache() {
+    return HAS_GM_STORAGE
+      && typeof crypto !== 'undefined'
+      && typeof crypto.subtle?.digest === 'function';
+  }
+
+  function getScanCacheLevel(scanMode) {
+    return ALT_SCAN_MODES.includes(scanMode) ? CHEATER_SCAN_CACHE_LEVEL_ALTS : CHEATER_SCAN_CACHE_LEVEL_LIGHT;
+  }
+
+  async function hashScanCacheKey(player) {
+    const data = new TextEncoder().encode(`${player.cfid}|${player.badge || ''}`);
+    const digest = await crypto.subtle.digest('SHA-256', data);
+    return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0'))
+      .join('')
+      .slice(0, CHEATER_SCAN_CACHE_HASH_LENGTH);
+  }
+
+  function isScanCacheEntryFresh(entry, now = Date.now()) {
+    return Array.isArray(entry)
+      && typeof entry[0] === 'number'
+      && (now - entry[0]) < CHEATER_SCAN_CACHE_TTL_MS;
+  }
+
+  function loadScanCache() {
+    if (!HAS_GM_STORAGE) return {};
+
+    try {
+      const parsed = JSON.parse(GM_getValue(CHEATER_SCAN_CACHE_STORAGE_KEY, '{}'));
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  // Expired entries are dropped on every save, so the cache only ever holds the
+  // last day's worth.
+  function saveScanCache(cache) {
+    if (!HAS_GM_STORAGE) return;
+
+    const now = Date.now();
+    const kept = {};
+    for (const [hash, entry] of Object.entries(cache)) {
+      if (isScanCacheEntryFresh(entry, now)) kept[hash] = entry;
+    }
+
+    try {
+      GM_setValue(CHEATER_SCAN_CACHE_STORAGE_KEY, JSON.stringify(kept));
+    } catch (err) {
+      console.error('Could not save the scan cache:', err);
+    }
+  }
+
+  function clearScanCache() {
+    try {
+      GM_setValue(CHEATER_SCAN_CACHE_STORAGE_KEY, '{}');
+      toast('Scan cache cleared.');
+    } catch (err) {
+      console.error('Could not clear the scan cache:', err);
+      toast('Could not clear the scan cache.');
+    }
+  }
+
+  // Splits off the players a fresh, deep-enough entry says can be skipped.
+  async function filterCachedScanPlayers(players, scanMode) {
+    if (!canUseScanCache()) return { players, skippedCount: 0 };
+
+    const cache = loadScanCache();
+    const level = getScanCacheLevel(scanMode);
+    const now = Date.now();
+    const kept = [];
+
+    for (const player of players) {
+      const entry = cache[await hashScanCacheKey(player)];
+      if (isScanCacheEntryFresh(entry, now) && entry[1] >= level) continue;
+      kept.push(player);
+    }
+
+    return { players: kept, skippedCount: players.length - kept.length };
+  }
+
+  // A player is settled once everything about them has been read: on a scan that
+  // checks alts, that is not until every one of their alts has been visited too.
+  function isScanPlayerSettled(state, player) {
+    if (!ALT_SCAN_MODES.includes(state.scanMode)) return true;
+
+    const altChecks = state.altChecks || {};
+    return ((state.altLinks || {})[player.cfid] || []).every(altCfid => altChecks[altCfid]);
+  }
+
+  // Only a full read is cached, flagged or clean. A read that failed partway
+  // proves nothing, and caching it would hide the player for a day without them
+  // ever having been reported. On a scan that checks alts, every alt has to have
+  // been read too, BattlEye standing included.
+  function isFullyReadScanPlayer(state, player) {
+    if ((state.incompleteCfids || {})[player.cfid]) return false;
+    if (!ALT_SCAN_MODES.includes(state.scanMode)) return true;
+
+    const altCfids = (state.altLinks || {})[player.cfid];
+    if (!altCfids) return false;
+
+    const altChecks = state.altChecks || {};
+    return altCfids.every(altCfid => {
+      const check = altChecks[altCfid];
+      return check && !check.incomplete && Boolean(check.battlEye);
+    });
+  }
+
+  // Run after every profile, so a scan stopped partway still caches the players it
+  // finished. Each main is looked at once, the first time it is settled; cachedCfids
+  // records which ones have been dealt with, whether they went in or not.
+  async function recordScannedPlayers(state) {
+    if (!canUseScanCache()) return state;
+
+    const queue = state.profileQueue || [];
+    const handled = { ...(state.cachedCfids || {}) };
+    const fullyRead = [];
+
+    for (const player of queue.slice(0, state.profileIndex || 0)) {
+      if (player.kind === 'alt' || handled[player.cfid]) continue;
+      if (!isScanPlayerSettled(state, player)) continue;
+
+      handled[player.cfid] = true;
+      if (isFullyReadScanPlayer(state, player)) fullyRead.push(player);
+    }
+
+    if (fullyRead.length) {
+      // Loaded fresh rather than held for the whole scan, so entries another tab
+      // wrote in the meantime are kept.
+      const cache = loadScanCache();
+      const entry = [Date.now(), getScanCacheLevel(state.scanMode)];
+      for (const player of fullyRead) {
+        cache[await hashScanCacheKey(player)] = entry;
+      }
+      saveScanCache(cache);
+      debugLog('[CFTools Tools] Ban scan: cached', fullyRead.length, 'scanned player(s)');
+    }
+
+    return { ...state, cachedCfids: handled };
+  }
+
+  // "Ignore cache" checkbox shared by both scan dialogs. Ticking it scans everyone,
+  // though players are still cached as they finish. Not remembered: a full
+  // scan is the exception. Left out entirely if the cache cannot work here.
+  function createScanCacheField() {
+    if (!canUseScanCache()) return { element: null, isIgnored: () => false };
+
+    const row = document.createElement('label');
+    row.style.cssText = 'display: flex; align-items: center; gap: 8px; cursor: pointer; margin: 0 0 12px;';
+
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.style.cssText = 'width: 15px; height: 15px; accent-color: #1f6f4a; flex: none;';
+
+    const text = document.createElement('span');
+    const name = document.createElement('b');
+    name.textContent = 'Ignore cache';
+    const hint = document.createElement('span');
+    hint.textContent = ' - also scan (and report) players already scanned in the last 24h.';
+    hint.style.cssText = 'color: #9aa0a6;';
+    text.append(name, hint);
+
+    row.append(box, text);
+    return { element: row, isIgnored: () => box.checked };
+  }
+
+  const CHEATER_SCAN_MODES = [
+    {
+      value: 'light',
+      label: 'Light scan',
+      hint: 'Check each banned player for a cheater ban.',
+    },
+    {
+      value: 'deep',
+      label: 'Deep scan',
+      hint: `Also open each one's confirmed alts and check them for a BattlEye ban or any ban on ${ALT_SCAN_BAN_LISTS.join(' / ')}. Slower.`,
+    },
+    {
+      value: 'extreme',
+      label: 'Extreme scan',
+      hint: 'Deep scan on every player, not just the banned ones. Slowest.',
+    },
+  ];
+
+  // Kept in Tampermonkey storage alongside the server selection, so both dialogs
+  // open on whichever mode was used last.
+  function loadScanMode() {
+    if (!HAS_GM_STORAGE) return 'light';
+
+    try {
+      const saved = GM_getValue(CHEATER_SCAN_MODE_STORAGE_KEY, 'light');
+      return CHEATER_SCAN_MODES.some(mode => mode.value === saved) ? saved : 'light';
+    } catch {
+      return 'light';
+    }
+  }
+
+  function saveScanMode(mode) {
+    if (!HAS_GM_STORAGE) return;
+
+    try {
+      GM_setValue(CHEATER_SCAN_MODE_STORAGE_KEY, mode);
+    } catch (err) {
+      console.error('Could not save the scan mode:', err);
+    }
+  }
+
+  // Scan mode radios shared by both scan dialogs.
+  function createScanModeField() {
+    const initial = loadScanMode();
+
+    const field = document.createElement('div');
+    field.style.cssText = 'display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px;';
+
+    const inputs = CHEATER_SCAN_MODES.map(mode => {
+      const row = document.createElement('label');
+      row.style.cssText = 'display: flex; align-items: flex-start; gap: 8px; cursor: pointer; margin: 0;';
+
+      const input = document.createElement('input');
+      input.type = 'radio';
+      input.name = 'codex-cheater-scan-mode';
+      input.value = mode.value;
+      input.checked = mode.value === initial;
+      input.style.cssText = 'width: 15px; height: 15px; margin-top: 1px; accent-color: #1f6f4a; flex: none;';
+
+      const text = document.createElement('span');
+      const name = document.createElement('b');
+      name.textContent = mode.label;
+      const hint = document.createElement('span');
+      hint.textContent = ` - ${mode.hint}`;
+      hint.style.cssText = 'color: #9aa0a6;';
+      text.append(name, hint);
+
+      row.append(input, text);
+      field.appendChild(row);
+      return input;
+    });
+
+    return {
+      element: field,
+      getMode: () => inputs.find(input => input.checked)?.value || 'light',
+    };
+  }
+
+  // The player-list button has nothing to ask but the mode and the cache. Resolves
+  // with { scanMode, ignoreCache }, or null if it was cancelled.
+  function openScanModeDialog(playerCount, bannedCount) {
+    const open = document.getElementById('cheater-scan-mode-dialog');
+    if (open) {
+      open.querySelector('input:checked')?.focus();
+      return Promise.resolve(null);
+    }
+
+    return new Promise(resolve => {
+      const overlay = document.createElement('div');
+      overlay.id = 'cheater-scan-mode-dialog';
+      overlay.style.cssText = DIALOG_OVERLAY_CSS;
+
+      const panel = document.createElement('div');
+      panel.style.cssText = DIALOG_PANEL_CSS;
+
+      const title = document.createElement('div');
+      title.textContent = 'Scan Bans';
+      title.style.cssText = DIALOG_TITLE_CSS;
+
+      const hint = document.createElement('div');
+      hint.textContent = `${playerCount} player(s) in this list, ${bannedCount} carrying a public ban.`;
+      hint.style.cssText = DIALOG_HINT_CSS;
+
+      const modeField = createScanModeField();
+      const cacheField = createScanCacheField();
+
+      function close(result) {
+        document.removeEventListener('keydown', onDocumentKeydown, true);
+        overlay.remove();
+        resolve(result);
+      }
+
+      function submit() {
+        close({ scanMode: modeField.getMode(), ignoreCache: cacheField.isIgnored() });
+      }
+
+      function onDocumentKeydown(event) {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          close(null);
+          return;
+        }
+        if (event.key === 'Enter' && !isButtonKeyTarget(event)) {
+          event.preventDefault();
+          submit();
+        }
+      }
+
+      const spacer = document.createElement('div');
+      spacer.style.cssText = 'flex: 1;';
+
+      const cancelButton = createDialogButton('Cancel', DIALOG_NEUTRAL_BG, DIALOG_NEUTRAL_HOVER);
+      cancelButton.addEventListener('click', () => close(null));
+
+      const scanButton = createDialogButton('Scan', DIALOG_CONFIRM_BG, DIALOG_CONFIRM_HOVER);
+      scanButton.addEventListener('click', () => submit());
+
+      const actions = document.createElement('div');
+      actions.style.cssText = DIALOG_ACTIONS_CSS;
+      actions.append(spacer, cancelButton, scanButton);
+
+      panel.append(...[title, hint, modeField.element, cacheField.element, actions].filter(Boolean));
+      overlay.appendChild(panel);
+      overlay.addEventListener('mousedown', event => {
+        if (event.target === overlay) close(null);
+      });
+
+      document.addEventListener('keydown', onDocumentKeydown, true);
+      document.body.appendChild(overlay);
+      overlay.querySelector('input:checked')?.focus();
+    });
+  }
+
   async function startCheaterScan() {
     // An expired leftover is not a running scan: it would otherwise block every
     // later scan until a refresh happened to clear it.
@@ -3716,22 +4352,50 @@
       return;
     }
 
-    const players = getBannedDashboardPlayers();
-    if (!players.length) {
+    // Counted up front for the dialog; the list itself is re-read once the mode is
+    // known, as an extreme scan takes everyone.
+    const everyone = getDashboardPlayers();
+    if (!everyone.length) {
+      toast('No players in this list.');
+      return;
+    }
+
+    const bannedCount = everyone.filter(player => player.badge).length;
+    const choice = await openScanModeDialog(everyone.length, bannedCount);
+    if (!choice) return;
+
+    const { scanMode, ignoreCache } = choice;
+    saveScanMode(scanMode);
+
+    const candidates = getScanDashboardPlayers(scanMode);
+    if (!candidates.length) {
       toast('No players with public bans in this list.');
       return;
     }
 
+    const { players, skippedCount } = ignoreCache
+      ? { players: candidates, skippedCount: 0 }
+      : await filterCachedScanPlayers(candidates, scanMode);
+    if (!players.length) {
+      toast(`All ${skippedCount} player(s) were already scanned in the last 24h. Nothing to scan.`, 3000);
+      return;
+    }
+
+    // Starts straight on the profile stage the sweep ends with, since the list
+    // being scanned is already on screen.
     const saved = saveCheaterScanState({
-      stage: 'collect',
+      stage: 'profile-collect',
+      scanMode,
+      skippedCount,
       returnUrl: location.href,
-      queue: players,
-      index: 0,
-      results: [],
+      profileQueue: players,
+      profileIndex: 0,
+      banMatches: {},
     });
     if (!saved) return;
 
-    toast(`Starting cheater scan on ${players.length} player(s)...`);
+    const skippedNote = skippedCount ? `, ${skippedCount} skipped (cached)` : '';
+    toast(`Starting ${scanMode} scan on ${players.length} player(s)${skippedNote}...`);
     location.href = players[0].url;
   }
 
@@ -3743,7 +4407,7 @@
     btn.type = 'button';
     btn.className = 'btn btn-outline-danger btn-sm';
     btn.textContent = 'Scan Bans';
-    btn.title = 'Open every player carrying a public ban and report the ones banned as a cheater';
+    btn.title = 'Open every player carrying a public ban and report the ones banned as a cheater (deep scan also checks their confirmed alts)';
     btn.addEventListener('click', () => {
       startCheaterScan().catch(err => {
         console.error('Cheater scan failed to start:', err);
@@ -3804,7 +4468,7 @@
   const DASHBOARD_ID_RE = /\/dashboard\/([a-f0-9]{24})(?:\/|$)/i;
   // The stages a run can be interrupted during, which is also when the stop button
   // is worth showing.
-  const CHEATER_SCAN_ACTIVE_STAGES = ['collect', 'server-collect', 'profile-collect'];
+  const CHEATER_SCAN_ACTIVE_STAGES = ['server-collect', 'profile-collect'];
 
   function getDashboardServerIdFromUrl(href = location.href) {
     try {
@@ -3843,7 +4507,7 @@
   }
 
   // Checkbox picker over the servers CFTools' own nav says you have access to.
-  // Resolves with the chosen ids, or null if it was cancelled.
+  // Resolves with { serverIds, scanMode, ignoreCache }, or null if it was cancelled.
   function openScanServerPicker(servers) {
     const open = document.getElementById('cheater-scan-picker');
     if (open) {
@@ -3866,8 +4530,11 @@
       title.style.cssText = DIALOG_TITLE_CSS;
 
       const hint = document.createElement('div');
-      hint.textContent = 'Pick the servers to sweep. Each one is opened in turn, and every player on it carrying a public ban gets their profile checked.';
+      hint.textContent = 'Pick the servers to sweep. Each one is opened in turn, and every player on it carrying a public ban (every player at all, on an extreme scan) gets their profile checked.';
       hint.style.cssText = DIALOG_HINT_CSS;
+
+      const modeField = createScanModeField();
+      const cacheField = createScanCacheField();
 
       const list = document.createElement('div');
       list.style.cssText = `
@@ -3911,7 +4578,7 @@
           close(null);
           return;
         }
-        if (event.key === 'Enter') {
+        if (event.key === 'Enter' && !isButtonKeyTarget(event)) {
           event.preventDefault();
           submit();
         }
@@ -3923,7 +4590,7 @@
           error.textContent = 'Pick at least one server.';
           return;
         }
-        close(chosen);
+        close({ serverIds: chosen, scanMode: modeField.getMode(), ignoreCache: cacheField.isIgnored() });
       }
 
       const allButton = createDialogButton('Select all', DIALOG_NEUTRAL_BG, DIALOG_NEUTRAL_HOVER);
@@ -3948,7 +4615,7 @@
       actions.style.cssText = DIALOG_ACTIONS_CSS;
       actions.append(allButton, noneButton, spacer, cancelButton, scanButton);
 
-      panel.append(title, hint, list, error, actions);
+      panel.append(...[title, hint, modeField.element, cacheField.element, list, error, actions].filter(Boolean));
       overlay.appendChild(panel);
       overlay.addEventListener('mousedown', event => {
         if (event.target === overlay) close(null);
@@ -4095,10 +4762,12 @@
       return;
     }
 
-    const chosenIds = await openScanServerPicker(servers);
-    if (!chosenIds?.length) return;
+    const choice = await openScanServerPicker(servers);
+    if (!choice?.serverIds.length) return;
 
+    const { serverIds: chosenIds, scanMode, ignoreCache } = choice;
     saveSelectedScanServerIds(chosenIds);
+    saveScanMode(scanMode);
 
     // Built from the nav's own order so the report reads the way the sidebar does.
     const serverQueue = servers
@@ -4109,6 +4778,8 @@
     const saved = saveCheaterScanState({
       stage: 'server-collect',
       mode: 'multi',
+      scanMode,
+      ignoreCache,
       returnUrl: location.href,
       serverQueue,
       serverIndex: 0,
@@ -4116,29 +4787,37 @@
     });
     if (!saved) return;
 
-    toast(`Starting ban scan on ${serverQueue.length} server(s)...`);
+    toast(`Starting ${scanMode} ban scan on ${serverQueue.length} server(s)...`);
     location.href = serverQueue[0].url;
   }
 
   // Every server has been read, so the players are flattened into one visit list.
   // A player online on two selected servers is visited once and then reported
-  // under both, which the per-server layout gets for free.
+  // under both, which the per-server layout gets for free. Players the cache says
+  // were scanned recently are dropped here, after the merge, so each one is
+  // counted as skipped once.
   async function startCheaterScanProfilePhase(state) {
     const serverPlayers = state.serverPlayers || {};
-    const profileQueue = [];
+    const candidates = [];
     const seen = new Set();
 
     for (const server of state.serverQueue || []) {
       for (const player of serverPlayers[server.id] || []) {
         if (seen.has(player.cfid)) continue;
         seen.add(player.cfid);
-        profileQueue.push(player);
+        candidates.push(player);
       }
     }
+
+    const { players: profileQueue, skippedCount } = state.ignoreCache
+      ? { players: candidates, skippedCount: 0 }
+      : await filterCachedScanPlayers(candidates, state.scanMode);
+    if (skippedCount) toast(`Skipping ${skippedCount} player(s) already scanned in the last 24h.`, 3000);
 
     const nextState = {
       ...state,
       stage: 'profile-collect',
+      skippedCount,
       profileQueue,
       profileIndex: 0,
       banMatches: {},
@@ -4160,29 +4839,18 @@
   function buildMultiServerCheaterScanReport(state) {
     const servers = state.serverQueue || [];
     const serverPlayers = state.serverPlayers || {};
-    const banMatches = state.banMatches || {};
-    const flaggedCfids = new Set();
     const lines = [];
 
     // A server only earns a section by having someone to report. A sweep of a dozen
     // servers is mostly quiet ones, and listing them all buries the hits.
     servers.forEach(server => {
       const flagged = (serverPlayers[server.id] || [])
-        .filter(player => (banMatches[player.cfid] || []).length);
+        .filter(player => isFlaggedScanPlayer(state, player.cfid));
       if (!flagged.length) return;
 
       lines.push('');
       lines.push(server.name);
-
-      flagged.forEach(player => {
-        flaggedCfids.add(player.cfid);
-        lines.push(`${player.name} - ${player.url}`);
-
-        banMatches[player.cfid].forEach(ban => {
-          const suffix = ban.issued ? ` (issued ${ban.issued})` : '';
-          lines.push(`- [${ban.banList || 'Unknown ban list'}] ${ban.reason || 'No reason given'}${suffix}`);
-        });
-      });
+      flagged.forEach(player => appendScanPlayerLines(lines, state, player));
     });
 
     if (!lines.length) {
@@ -4190,11 +4858,7 @@
       lines.push('None found');
     }
 
-    return [
-      'Cheater Ban Scan',
-      `Players with a ${CHEATER_BAN_KEYWORDS.join(' / ')} ban: ${flaggedCfids.size}`,
-      ...lines,
-    ].join('\n');
+    return [...buildScanReportHeader(state), ...lines].join('\n');
   }
 
   // Sidebar entry point, sat on the Servers heading with the add-server and
